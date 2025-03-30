@@ -1,3 +1,5 @@
+[![Rust](https://github.com/kn0sys/qfe/actions/workflows/rust.yml/badge.svg)](https://github.com/kn0sys/qfe/actions/workflows/rust.yml)
+
 # Qualitative Frame Entanglement (QFE)
 
 This repository contains a Rust implementation simulating an experimental protocol for secure communication, referred to here as 'QFE'. The protocol relies on establishing a unique shared state (`SQS`) between two parties (represented as `Frame`s) and uses stateful, modulated encoding with built-in integrity checks designed to detect tampering.
@@ -147,6 +149,6 @@ Licensed under
 
 MIT license (LICENSE-MIT or http://opensource.org/licenses/MIT)
 
-## Contributing 1
+## Contributing
 
 Contributions are welcome! Please feel free to submit issues or pull requests.
