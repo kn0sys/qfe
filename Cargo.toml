@@ -1,0 +1,25 @@
+[package]
+name = "qfe"
+version = "0.1.0"
+edition = "2024"
+authors = ["n12n <nigel.christian@hiahatf.org>", "Gemini"]
+documentation = "https://docs.rs/qfe"
+description = "Experimental protocol for quantum-secure communications"
+repository = "https://github.com/kn0sys/qfe"
+license = "MIT"
+readme = "README.md"
+keywords = [
+    "ai",
+    "pqs",
+    "quantum-proof",
+    "quantum",
+    "security"
+]
+categories = ["cryptography"]
+
+[lib]
+name = "qfe"
+path = "src/lib.rs"
+crate-type = ["lib"]
+
+[dependencies]
