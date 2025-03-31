@@ -10,8 +10,6 @@ use std::fmt;
 // // --- Constants derived from Framework Core Mathematics ---
 // Primary Scale: φ (phi)
 const PHI: f64 = 1.618033988749895;
-// Angular Division related constant (example, could be derived differently)
-// const ANGULAR_DIVISION: f64 = 2.0 * std::f64::consts::PI / PHI;
 // Resonance: φ/2π
 const RESONANCE_FREQ: f64 = PHI / (2.0 * std::f64::consts::PI);
 
@@ -545,14 +543,14 @@ pub fn establish_sqs(frame_a: &mut Frame, frame_b: &mut Frame) -> Result<(), Qfe
     let shared_phase_lock = shared_phase_lock.rem_euclid(2.0 * std::f64::consts::PI);
 
 
-    // --- Validation Checks (Simulated Framework C1, C3) ---
-    // C1: Phase Coherence. Did the interaction result in a reasonably synchronized phase?
+    // --- Validation Checks ---
+    // Did the interaction result in a reasonably synchronized phase?
     let c1_check = shared_phase_lock.is_finite();
     // Alternative simpler check: Use COHERENCE_THRESHOLD relationship? Check relative phase diff? Needs refinement based on  theory.
     // For now, let's use a basic check that *some* convergence happened:
     // let c1_check = (phase_coherence_a + phase_coherence_b) / 2.0 < std::f64::consts::PI / 2.0; // Less strict check
 
-    // C3: Pattern Resonance. Does the resulting structure (components) seem valid?
+    // Does the resulting structure (components) seem valid?
     // Simplistic check: Ensure the shared secret isn't empty or trivial.
     let c3_check = !shared_components.is_empty() && shared_components.len() >= 8; // e.g., require minimum length
 
@@ -588,8 +586,6 @@ pub fn establish_sqs(frame_a: &mut Frame, frame_b: &mut Frame) -> Result<(), Qfe
         )))
     }
 }
-
-// Add these helper functions within src/lib.rs (not in impl block)
 
 /// Calculates an integrity hash for a byte using Sqs components.
 /// This ties the encoded unit to the specific Sqs shared secret.
@@ -682,7 +678,7 @@ mod tests {
         // Check properties of the shared Sqs
         assert_eq!(sqs_a.pattern_type, PatternType::Sqs);
         assert!(!sqs_a.components.is_empty());
-        assert!(sqs_a.components.len() >= 8); // Matches C3 check logic
+        assert!(sqs_a.components.len() >= 8); // Matches logic
         assert_eq!(sqs_a.resonance_freq, RESONANCE_FREQ);
         assert!(sqs_a.validation); // Sqs itself should be marked valid
     }
@@ -743,7 +739,7 @@ mod tests {
         let mut frame_a = Frame::initialize("A_fail".to_string(), 0); // Use seeds known to cause issues if found
         let mut frame_b = Frame::initialize("B_fail".to_string(), 0);
 
-        // Manually set phase for easier testing of C1 check if needed
+        // Manually set phase for easier testing if needed
         // frame_a.phase = 0.0;
         // frame_b.phase = std::f64::consts::PI; // Max difference
 
