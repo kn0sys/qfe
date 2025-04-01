@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn Error>> { // Use standard result type for main
             println!("    Encoding successful. Signal length: {}", signal.len());
              if !signal.is_empty() {
                  // Display first unit hash for visualization
-                 println!("    First Encoded Unit Hash: {:x}", signal[0].integrity_hash);
+                 println!("    First Encoded Unit Hash: {:?}", signal[0].integrity_hash);
              }
             signal
         }
@@ -82,7 +82,7 @@ fn main() -> Result<(), Box<dyn Error>> { // Use standard result type for main
     let mut tampered_signal = encoded_signal.clone();
     if !tampered_signal.is_empty() {
         println!("    Tampering with integrity hash of first signal unit...");
-        tampered_signal[0].integrity_hash = tampered_signal[0].integrity_hash.wrapping_add(1); // Corrupt hash
+        tampered_signal[0].integrity_hash[0] ^= 0x01; // Corrupt hash
     }
 
     println!("    Frame B attempting to decode tampered signal...");

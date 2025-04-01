@@ -6,6 +6,8 @@ use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher; // Simple standard hasher
 use std::error::Error;
 use std::fmt;
+use sha2::{Sha512, Digest};
+
 
 // // --- Constants derived from Framework Core Mathematics ---
 // Primary Scale: φ (phi)
@@ -16,36 +18,30 @@ const RESONANCE_FREQ: f64 = PHI / (2.0 * std::f64::consts::PI);
 // --- Core Data Structures ---
 
 /// Represents one unit of encoded information.
-///
-/// Contains state information resulting from encoding and an integrity check value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)] // Added Eq for array comparison
 pub struct EncodedUnit {
     /// The phase state ([0, 2PI)) after encoding this unit.
+    // Note: f64 doesn't implement Eq, so PartialEq remains. If EncodedUnit needs Eq, phase might need adjusted representation.
+    // For now, PartialEq is sufficient as we compare hashes as arrays.
     pub modulated_phase: f64,
-    /// Integrity value calculated using the original byte and Sqs components.
-    /// Ensures coherence and detects tampering.
-    pub integrity_hash: u64,
+    /// Integrity value (SHA-512 hash) calculated using the original byte and Sqs components.
+    // CHANGED: Type from u64 to [u8; 64] for SHA-512 output
+    pub integrity_hash: [u8; 64],
 }
 
 /// Custom error types for the QFE library operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QfeError {
-    /// Error during SQS establishment phase. Contains specific reason.
     SqsEstablishmentFailed(String),
-    /// Error during the encoding process.
-    EncodingFailed(String), // Placeholder for potential future encoding errors
-    /// Error during the decoding process (e.g., integrity, phase shift validation). Contains specific reason.
+    EncodingFailed(String),
     DecodingFailed(String),
-    /// Decoded bytes were not valid UTF-8 when using string conversion methods.
     InvalidUtf8(std::string::FromUtf8Error),
-    /// The Frame attempting the operation is in an invalid state (validation_status is false).
     FrameInvalid,
-    /// Required SQS component is missing for the operation.
     SqsMissing,
-    /// An unexpected internal state or logic error occurred.
     InternalError(String),
 }
 
+// Display and Error impl remain the same...
 impl fmt::Display for QfeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -59,9 +55,53 @@ impl fmt::Display for QfeError {
         }
     }
 }
-
-// Allow QfeError to be treated as a standard Error
 impl Error for QfeError {}
+
+
+/// Represents the established shared state (secret key and context) between two Frames.
+#[derive(Clone, PartialEq)] // SQS components (Vec<u8>) make Eq complex, PartialEq is fine.
+pub struct Sqs {
+    pattern_type: PatternType,
+    /// The core shared secret (SHA-512 hash output) derived from the interaction.
+    // Note: components are now 64 bytes long.
+    pub components: Vec<u8>,
+    /// Represents the synchronized phase derived from interaction.
+    pub shared_phase_lock: f64,
+    /// A characteristic frequency parameter associated with this shared state.
+    resonance_freq: f64,
+    /// Internal validation status determined during creation.
+    validation: bool,
+}
+
+// Debug impl for Sqs remains the same (still uses DefaultHasher for display hash)
+impl fmt::Debug for Sqs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sqs")
+         .field("pattern_type", &self.pattern_type)
+         .field("components_len", &self.components.len())
+         .field("components_hash", &{
+             let mut hasher = DefaultHasher::new(); // Use DefaultHasher just for debug display
+             self.components.hash(&mut hasher);
+             format!("{:x}", hasher.finish())
+         })
+         .field("shared_phase_lock", &self.shared_phase_lock)
+         .field("resonance_freq", &self.resonance_freq)
+         .field("validation", &self.validation)
+         .finish()
+    }
+}
+
+
+/// Represents a participant Frame (e.g., Sender A, Receiver B).
+#[derive(Debug, Clone)]
+pub struct Frame {
+    id: String,
+    node: DistinctionNode,
+    frame_structure: ReferenceFrame,
+    phase: f64,
+    sqs_component: Option<Arc<Sqs>>,
+    validation_status: bool,
+}
 
 // --- Framework Primitive Representations ---
 
@@ -118,57 +158,6 @@ impl fmt::Debug for ReferenceFrame {
 enum PatternType {
     Sqs, // Shared Qualitative Structure
     // Future types: Information, Transformation, etc.
-}
-
-/// Represents the Shared Qualitative Structure (Sqs) - The "Key".
-/// Result of successful interaction between two Frames.
-/// This structure holds the shared secret information and synchronization parameters.
-#[derive(Clone, PartialEq)]
-pub struct Sqs {
-    pattern_type: PatternType,
-    /// The core shared secret derived from the interaction.
-    /// Represents the resulting complex structure from Framework's perspective.
-    /// Analogous to components: [⊕─○, ○↔○...] resulting state.
-    pub components: Vec<u8>,
-    /// Represents the synchronized phase derived from interaction (Framework ○↔○).
-    pub shared_phase_lock: f64,
-    /// The inherent resonance frequency of this structure (Framework Critical Ratio).
-    resonance_freq: f64, // Should align with RESONANCE_FREQ
-    /// Validation status based on coherence checks during creation.
-    validation: bool,
-}
-
-// Custom Debug for Sqs to avoid printing large component vectors directly
-impl fmt::Debug for Sqs {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Sqs")
-         .field("pattern_type", &self.pattern_type)
-         .field("components_len", &self.components.len()) // Show length only
-         .field("components_hash", &{ // Show hash for identification
-             let mut hasher = DefaultHasher::new();
-             self.components.hash(&mut hasher);
-             format!("{:x}", hasher.finish())
-         })
-         .field("shared_phase_lock", &self.shared_phase_lock)
-         .field("resonance_freq", &self.resonance_freq)
-         .field("validation", &self.validation)
-         .finish()
-    }
-}
-
-/// Represents a participant Frame (e.g., Sender A, Receiver B).
-/// Contains its unique structure, phase, and potentially a shared Sqs.
-#[derive(Debug, Clone)]
-pub struct Frame {
-    id: String,
-    node: DistinctionNode, //  Axiom: Distinction
-    frame_structure: ReferenceFrame, //  D4: Structure
-    phase: f64, //  D4: Direction/Orientation represented by phase θ
-    // internal_patterns: Vec<Pattern>, // For future encoding steps.
-    /// Holds the shared Sqs via an Arc if established.
-    sqs_component: Option<Arc<Sqs>>,
-    /// Tracks if the frame's operations are coherent.
-    validation_status: bool,
 }
 
 // --- QFE Algorithm Implementation ---
@@ -291,7 +280,7 @@ impl Frame {
             let next_phase = (current_phase + phase_shift).rem_euclid(2.0 * std::f64::consts::PI);
 
             // 3. Calculate integrity hash using the original byte and Sqs secret
-            let integrity_hash = calculate_integrity_hash(byte, &sqs.components);
+            let integrity_hash = calculate_integrity_hash_sha512(byte, &sqs.components);
 
             // 4. Store the resulting state (new phase) and integrity hash
             encoded_signal.push(EncodedUnit {
@@ -360,7 +349,7 @@ impl Frame {
 
             // 3. Verify Integrity (Crucial Security Step -  Step 6 simulated)
             //    Recalculate the hash using the reconstructed byte and *this frame's* Sqs components.
-            let expected_hash = calculate_integrity_hash(reconstructed_byte, &sqs.components);
+            let expected_hash = calculate_integrity_hash_sha512(reconstructed_byte, &sqs.components);
 
             if expected_hash != unit.integrity_hash {
                 // Mismatch! This indicates tampering or decoding with the wrong Sqs.
@@ -480,7 +469,6 @@ pub fn setup_qfe_pair(
 ///     - An SQS is already established for one or both frames (`QfeError::SqsEstablishmentFailed`).
 ///     - The simulated interaction fails internal checks (`QfeError::SqsEstablishmentFailed`).
 pub fn establish_sqs(frame_a: &mut Frame, frame_b: &mut Frame) -> Result<(), QfeError> {
-    // --- Pre-checks ---
     if !frame_a.validation_status || !frame_b.validation_status {
          return Err(QfeError::FrameInvalid);
     }
@@ -490,113 +478,80 @@ pub fn establish_sqs(frame_a: &mut Frame, frame_b: &mut Frame) -> Result<(), Qfe
         ));
     }
 
-    // --- Interaction Simulation ---
-    // 1. Frames calculate their influence based on internal state.
-    let aspect_a = frame_a.calculate_interaction_aspect();
-    let aspect_b = frame_b.calculate_interaction_aspect();
+    let aspect_a = frame_a.calculate_interaction_aspect(); // Still u64 for now
+    let aspect_b = frame_b.calculate_interaction_aspect(); // Still u64 for now
 
-    // 2. Derive shared components via simulated interaction/feedback convergence.
-    //    This function MUST be deterministic and symmetric in its core logic
-    //    if the inputs were swapped, ensuring both frames arrive at the same result.
-    //    It simulates the Framework Field Overlay (F = F1 ⊗ F2) leading to P_sqs.
-    fn derive_shared_components(aspect1: u64, phase1: f64, aspect2: u64, phase2: f64) -> Vec<u8> {
-        let mut hasher = DefaultHasher::new();
-        // Hash aspects in a consistent order (e.g., smaller first) for symmetry
-        if aspect1 < aspect2 {
-            aspect1.hash(&mut hasher);
-            aspect2.hash(&mut hasher);
-        } else {
-            aspect2.hash(&mut hasher);
-            aspect1.hash(&mut hasher);
-        }
-        // Combine phases in a way sensitive to both values
-        let phase_combined = (phase1 + phase2) * PHI; // Use PHI in calculation
-        phase_combined.to_bits().hash(&mut hasher);
-        // Add framework constant for specificity
-        RESONANCE_FREQ.to_bits().hash(&mut hasher);
+    // CHANGED: Use SHA-512 based derivation for SQS components
+    let shared_components = derive_shared_components_sha512(aspect_a, frame_a.phase, aspect_b, frame_b.phase);
 
-        hasher.finish().to_le_bytes().to_vec() // Use resulting hash as shared bytes
-    }
-
-    // Both frames perform the calculation using their own aspect and the other's
-    let components_for_a = derive_shared_components(aspect_a, frame_a.phase, aspect_b, frame_b.phase);
-    let components_for_b = derive_shared_components(aspect_b, frame_b.phase, aspect_a, frame_a.phase);
-
-    // This check should always pass if derive_shared_components is symmetric. Included for safety.
-    if components_for_a != components_for_b {
-        frame_a.validation_status = false;
-        frame_b.validation_status = false;
-        // This indicates a fundamental failure in the simulated physics/interaction logic
-        return Err(QfeError::SqsEstablishmentFailed(
-            "Asymmetric interaction simulation".to_string(),
-        ));
-    }
-    let shared_components = components_for_a; // They are identical
-
-    // 3. Derive the shared phase lock (Framework ○↔○) from interaction results.
-    //    Simple approach: Weighted average based on interaction aspects.
-    let weight_a = (aspect_a % 1000 + 1) as f64; // Simple weight from aspect hash
+    // Phase lock calculation remains the same
+    let weight_a = (aspect_a % 1000 + 1) as f64;
     let weight_b = (aspect_b % 1000 + 1) as f64;
     let total_weight = weight_a + weight_b;
     let shared_phase_lock = (frame_a.phase * weight_a + frame_b.phase * weight_b) / total_weight;
-    // Ensure phase wraps correctly [0, 2PI) - use f64::rem_euclid
     let shared_phase_lock = shared_phase_lock.rem_euclid(2.0 * std::f64::consts::PI);
 
-
-    // --- Validation Checks ---
-    // Did the interaction result in a reasonably synchronized phase?
+    // Validation checks remain the same conceptually, but C3 now checks 64 bytes
     let c1_check = shared_phase_lock.is_finite();
-    // Alternative simpler check: Use COHERENCE_THRESHOLD relationship? Check relative phase diff? Needs refinement based on  theory.
-    // For now, let's use a basic check that *some* convergence happened:
-    // let c1_check = (phase_coherence_a + phase_coherence_b) / 2.0 < std::f64::consts::PI / 2.0; // Less strict check
-
-    // Does the resulting structure (components) seem valid?
-    // Simplistic check: Ensure the shared secret isn't empty or trivial.
-    let c3_check = !shared_components.is_empty() && shared_components.len() >= 8; // e.g., require minimum length
-
+    let c3_check = !shared_components.is_empty() && shared_components.len() == 64; // Check for 64 bytes from SHA-512
 
     let validation_passed = c1_check && c3_check;
 
-    // --- Finalize Sqs ---
     if validation_passed {
         let sqs = Arc::new(Sqs {
             pattern_type: PatternType::Sqs,
-            components: shared_components,
+            components: shared_components, // Now contains 64 bytes
             shared_phase_lock,
-            resonance_freq: RESONANCE_FREQ, // Set framework constant
+            resonance_freq: RESONANCE_FREQ,
             validation: true,
         });
-
-        // Update both frames to point to the same Sqs instance
         frame_a.sqs_component = Some(Arc::clone(&sqs));
         frame_b.sqs_component = Some(sqs);
-
-        // Optional: Update frame phases to the shared lock phase? Or keep original?
-        // Let's keep original for now, Sqs holds the *synchronized* value.
-        // frame_a.phase = shared_phase_lock;
-        // frame_b.phase = shared_phase_lock;
-
         Ok(())
     } else {
         frame_a.validation_status = false;
         frame_b.validation_status = false;
         Err(QfeError::SqsEstablishmentFailed(format!(
-            "Validation failed: PhaseCoherenceCheck(ValidNumber)={}, PatternResonanceCheck(NonTrivial)={}",
+            "Validation failed: PhaseCoherenceCheck(ValidNumber)={}, PatternResonanceCheck(NonTrivial SHA512)={}", // Updated msg
             c1_check, c3_check
         )))
     }
 }
 
-/// Calculates an integrity hash for a byte using Sqs components.
-/// This ties the encoded unit to the specific Sqs shared secret.
-fn calculate_integrity_hash(byte: u8, sqs_components: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    byte.hash(&mut hasher);
-    sqs_components.hash(&mut hasher); // Include the shared secret
-    // Optionally include framework constants for more specificity
-    RESONANCE_FREQ.to_bits().hash(&mut hasher);
-    PHI.to_bits().hash(&mut hasher);
-    hasher.finish()
+/// Calculates an integrity hash (SHA-512) for a byte using Sqs components.
+// CHANGED: New function using SHA-512
+fn calculate_integrity_hash_sha512(byte: u8, sqs_components: &[u8]) -> [u8; 64] {
+    // Instantiate SHA-512 hasher
+    let mut hasher = Sha512::new();
+    // Update hasher with byte, SQS components, and constants
+    hasher.update(&[byte]); // Feed the byte
+    hasher.update(sqs_components); // Feed the SQS shared secret
+    hasher.update(&RESONANCE_FREQ.to_le_bytes()); // Feed constants consistently
+    hasher.update(&PHI.to_le_bytes());
+    // Finalize and convert to fixed-size array
+    hasher.finalize().into()
+}
+
+// NEW: Helper function to derive SQS components using SHA-512
+// This replaces the DefaultHasher logic previously inline in establish_sqs
+fn derive_shared_components_sha512(aspect1: u64, phase1: f64, aspect2: u64, phase2: f64) -> Vec<u8> {
+    let mut hasher = Sha512::new();
+    // Feed aspects in a consistent order for symmetry
+    if aspect1 < aspect2 {
+        hasher.update(&aspect1.to_le_bytes());
+        hasher.update(&aspect2.to_le_bytes());
+    } else {
+        hasher.update(&aspect2.to_le_bytes());
+        hasher.update(&aspect1.to_le_bytes());
+    }
+    // Combine phases (consistent order not needed here, just combination)
+    let phase_combined = (phase1 + phase2) * PHI;
+    hasher.update(&phase_combined.to_le_bytes());
+    // Add framework constants
+    hasher.update(&RESONANCE_FREQ.to_le_bytes());
+    hasher.update(&PHI.to_le_bytes());
+    // Return the 64-byte hash result as Vec<u8>
+    hasher.finalize().to_vec()
 }
 
 // --- Phase Modulation Constants and Helpers ---
@@ -680,6 +635,7 @@ mod tests {
         assert!(!sqs_a.components.is_empty());
         assert!(sqs_a.components.len() >= 8); // Matches logic
         assert_eq!(sqs_a.resonance_freq, RESONANCE_FREQ);
+        assert_eq!(sqs_a.components.len(), 64, "SQS components should be 64 bytes for SHA-512");
         assert!(sqs_a.validation); // Sqs itself should be marked valid
     }
 
@@ -774,7 +730,9 @@ mod tests {
         // Encode by Frame A
         let encoded = frame_a.encode(message_bytes).expect("Encoding failed");
         assert_eq!(encoded.len(), message_bytes.len(), "Encoded length mismatch");
-
+        if let Some(unit) = encoded.first() {
+             assert_eq!(unit.integrity_hash.len(), 64, "Integrity hash should be 64 bytes");
+        }
         // Decode by Frame B
         let decoded_bytes = frame_b.decode(&encoded).expect("Decoding failed");
         assert_eq!(decoded_bytes, message_bytes, "Decoded bytes mismatch");
@@ -817,7 +775,7 @@ mod tests {
 
         // Tamper: Modify the hash of the first unit
         if !encoded.is_empty() {
-            encoded[0].integrity_hash = encoded[0].integrity_hash.wrapping_add(1); // Corrupt hash
+            encoded[0].integrity_hash[0] ^= 0x01; // Corrupt hash
         }
 
         let result = frame_b.decode(&encoded);
@@ -897,7 +855,7 @@ mod tests {
      #[test]
     fn decode_fails_if_frame_has_no_sqs() {
          let mut frame_no_sqs = Frame::initialize("NoSqs_Dec".to_string(), 1);
-         let encoded_signal = vec![EncodedUnit { modulated_phase: 1.0, integrity_hash: 123 }];
+         let encoded_signal = vec![EncodedUnit { modulated_phase: 1.0, integrity_hash: [0u8; 64] }];
          let result = frame_no_sqs.decode(&encoded_signal);
          assert!(result.is_err());
          assert_eq!(result.unwrap_err(), QfeError::SqsMissing);
