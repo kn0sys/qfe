@@ -524,10 +524,10 @@ fn calculate_integrity_hash_sha512(byte: u8, sqs_components: &[u8]) -> [u8; 64] 
     // Instantiate SHA-512 hasher
     let mut hasher = Sha512::new();
     // Update hasher with byte, SQS components, and constants
-    hasher.update(&[byte]); // Feed the byte
+    hasher.update([byte]); // Feed the byte
     hasher.update(sqs_components); // Feed the SQS shared secret
-    hasher.update(&RESONANCE_FREQ.to_le_bytes()); // Feed constants consistently
-    hasher.update(&PHI.to_le_bytes());
+    hasher.update(RESONANCE_FREQ.to_le_bytes()); // Feed constants consistently
+    hasher.update(PHI.to_le_bytes());
     // Finalize and convert to fixed-size array
     hasher.finalize().into()
 }
@@ -538,18 +538,18 @@ fn derive_shared_components_sha512(aspect1: u64, phase1: f64, aspect2: u64, phas
     let mut hasher = Sha512::new();
     // Feed aspects in a consistent order for symmetry
     if aspect1 < aspect2 {
-        hasher.update(&aspect1.to_le_bytes());
-        hasher.update(&aspect2.to_le_bytes());
+        hasher.update(aspect1.to_le_bytes());
+        hasher.update(aspect2.to_le_bytes());
     } else {
-        hasher.update(&aspect2.to_le_bytes());
-        hasher.update(&aspect1.to_le_bytes());
+        hasher.update(aspect2.to_le_bytes());
+        hasher.update(aspect1.to_le_bytes());
     }
     // Combine phases (consistent order not needed here, just combination)
     let phase_combined = (phase1 + phase2) * PHI;
-    hasher.update(&phase_combined.to_le_bytes());
+    hasher.update(phase_combined.to_le_bytes());
     // Add framework constants
-    hasher.update(&RESONANCE_FREQ.to_le_bytes());
-    hasher.update(&PHI.to_le_bytes());
+    hasher.update(RESONANCE_FREQ.to_le_bytes());
+    hasher.update(PHI.to_le_bytes());
     // Return the 64-byte hash result as Vec<u8>
     hasher.finalize().to_vec()
 }
