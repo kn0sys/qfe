@@ -38,7 +38,7 @@ cargo run --example hello
 ```
 
 ```rust
-// examples/hello.rs
+// qfe/examples/hello.rs
 
 // Import necessary items from the qfe library crate
 use qfe::{setup_qfe_pair, QfeError}; // Use setup_qfe_pair and the error type
@@ -49,11 +49,11 @@ fn main() -> Result<(), Box<dyn Error>> { // Use standard result type for main
 
     // 1. Setup communication pair using the simplified API
     println!("\n[1] Initializing Frames and establishing SQS...");
-    let (mut frame_a, mut frame_b) = match setup_qfe_pair(
+    let (frame_a, mut frame_b) = match setup_qfe_pair(
         "Frame_A".to_string(), // ID for Frame A
-        20250330,             // Seed for Frame A (Example Seed)
+        20250330,             // Seed for Frame A
         "Frame_B".to_string(), // ID for Frame B
-        115702,             // Seed for Frame B (Example Seed)
+        115702,             // Seed for Frame B
     ) {
         Ok(pair) => {
             println!("    Frames A & B initialized and SQS established successfully.");
@@ -64,7 +64,14 @@ fn main() -> Result<(), Box<dyn Error>> { // Use standard result type for main
             return Err(Box::new(e)); // Convert QfeError to Box<dyn Error>
         }
     };
-    println!("    Frame A Valid: {}", frame_a.is_valid());
+
+    // Optional: Display some info about the frames/SQS
+     println!("    Frame A Valid: {}", frame_a.is_valid());
+     // println!("    Frame A SQS Components Hash: {:x}", {
+     //     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+     //     frame_a.get_sqs().unwrap().components.hash(&mut hasher);
+     //     hasher.finish()
+     // });
 
     // 2. Define the message
     let original_message = "Hello, world!";
@@ -76,7 +83,8 @@ fn main() -> Result<(), Box<dyn Error>> { // Use standard result type for main
         Ok(signal) => {
             println!("    Encoding successful. Signal length: {}", signal.len());
              if !signal.is_empty() {
-                 println!("    First Encoded Unit Hash: {:x}", signal[0].integrity_hash);
+                 // Display first unit hash for visualization
+                 println!("    First Encoded Unit Hash: {:?}", signal[0].integrity_hash);
              }
             signal
         }
@@ -95,6 +103,7 @@ fn main() -> Result<(), Box<dyn Error>> { // Use standard result type for main
         }
         Err(e) => {
             eprintln!("    Error during decoding: {}", e);
+            // Even if decoding fails, check frame B's validity state
             println!("    Frame B Valid after failed decode attempt: {}", frame_b.is_valid());
             return Err(Box::new(e));
         }
@@ -113,14 +122,15 @@ fn main() -> Result<(), Box<dyn Error>> { // Use standard result type for main
     let mut tampered_signal = encoded_signal.clone();
     if !tampered_signal.is_empty() {
         println!("    Tampering with integrity hash of first signal unit...");
-        tampered_signal[0].integrity_hash = tampered_signal[0].integrity_hash.wrapping_add(1); // Corrupt hash
+        tampered_signal[0].integrity_hash[0] ^= 0x01; // Corrupt hash
     }
 
     println!("    Frame B attempting to decode tampered signal...");
     match frame_b.decode_to_str(&tampered_signal) {
         Ok(msg) => {
+             // This should NOT happen
              eprintln!("    ERROR: Decoding tampered signal succeeded unexpectedly! Decoded: '{}'", msg);
-             return Err("Tamper detection failed!".into());
+             return Err("Tamper detection failed!".into()); // Use basic error conversion
         }
         Err(e) => {
              println!("    Successfully detected tampering!");
@@ -129,6 +139,7 @@ fn main() -> Result<(), Box<dyn Error>> { // Use standard result type for main
                  QfeError::DecodingFailed(_) => println!("    Error type is correctly DecodingFailed."),
                  _ => eprintln!("    WARNING: Incorrect error type reported for tamper detection: {:?}", e),
              }
+             // Crucially, check if Frame B was marked invalid
              assert!(!frame_b.is_valid(), "Frame B should be marked invalid after detecting tampering");
              println!("    Frame B validation status correctly set to: {}", frame_b.is_valid());
         }
