@@ -8,6 +8,9 @@ use std::error::Error;
 use std::fmt;
 use sha2::{Sha512, Digest};
 
+pub mod zkp;
+pub use zkp::{ZkpCommitment, ZkpChallenge, ZkpResponse, establish_zkp_sqs};
+pub type Sha512Hash = [u8; 64];
 
 // // --- Constants derived from Framework Core Mathematics ---
 // Primary Scale: φ (phi)
@@ -101,6 +104,7 @@ pub struct Frame {
     phase: f64,
     sqs_component: Option<Arc<Sqs>>,
     validation_status: bool,
+    zkp_witness: Option<Vec<u8>>,
 }
 
 // --- Framework Primitive Representations ---
@@ -200,6 +204,7 @@ impl Frame {
             // internal_patterns: Vec::new(),
             sqs_component: None,
             validation_status: true, // Starts valid
+            zkp_witness: None,
         }
     }
 
@@ -581,7 +586,7 @@ fn reconstruct_byte_from_phase_shift(shift: f64) -> Option<u8> {
     // Round to nearest integer and clamp to valid u8 range [0, 255]
     Some(byte_f.round().clamp(0.0, 255.0) as u8)
 }
-
+//
 // --- Unit Tests ---
 #[cfg(test)]
 mod tests {
