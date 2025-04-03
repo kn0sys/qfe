@@ -9,7 +9,7 @@ use std::fmt;
 use sha2::{Sha512, Digest};
 
 pub mod zkp;
-pub use zkp::{ZkpCommitment, ZkpChallenge, ZkpResponse, establish_zkp_sqs};
+pub use zkp::{ZkpChallenge, establish_zkp_sqs};
 pub type Sha512Hash = [u8; 64];
 
 // // --- Constants derived from Framework Core Mathematics ---
