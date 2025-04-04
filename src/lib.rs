@@ -9,7 +9,7 @@ use std::fmt;
 use sha2::{Sha512, Digest};
 
 pub mod zkp;
-pub use zkp::{ZkpChallenge, establish_zkp_sqs};
+pub use zkp::{ ZkpChallenge, ZkpValidityResponse, establish_zkp_sqs, generate_zkp_challenge };
 pub type Sha512Hash = [u8; 64];
 
 // // --- Constants derived from Framework Core Mathematics ---
@@ -104,7 +104,7 @@ pub struct Frame {
     phase: f64,
     sqs_component: Option<Arc<Sqs>>,
     validation_status: bool,
-    zkp_witness: Option<Vec<u8>>,
+    pub zkp_witness: Option<Vec<u8>>,
 }
 
 // --- Framework Primitive Representations ---
