@@ -62,7 +62,7 @@ impl Error for QfeError {}
 
 
 /// Represents the established shared state (secret key and context) between two Frames.
-#[derive(Clone, PartialEq)] // SQS components (Vec<u8>) make Eq complex, PartialEq is fine.
+#[derive(Clone, Default, PartialEq)] // SQS components (Vec<u8>) make Eq complex, PartialEq is fine.
 pub struct Sqs {
     pattern_type: PatternType,
     /// The core shared secret (SHA-512 hash output) derived from the interaction.
@@ -74,6 +74,10 @@ pub struct Sqs {
     resonance_freq: f64,
     /// Internal validation status determined during creation.
     validation: bool,
+    /// Identifier of the first participant establishing this SQS.
+    pub participant_a_id: String,
+    /// Identifier of the second participant establishing this SQS.
+    pub participant_b_id: String,
 }
 
 // Debug impl for Sqs remains the same (still uses DefaultHasher for display hash)
@@ -158,8 +162,9 @@ impl fmt::Debug for ReferenceFrame {
 
 
 /// Represents different types of patterns P(n) = Ω(x) × R(Ω).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 enum PatternType {
+    #[default]
     Sqs, // Shared Qualitative Structure
     // Future types: Information, Transformation, etc.
 }
@@ -421,6 +426,49 @@ impl Frame {
      pub fn is_valid(&self) -> bool {
         self.validation_status
     }
+
+    /// Calculates a short, human-readable fingerprint for the established SQS.
+    ///
+    /// This fingerprint should be compared out-of-band with the other participant's
+    /// fingerprint after `establish_sqs` completes successfully. A match provides
+    /// strong evidence against a Man-in-the-Middle (MitM) attack during the SQS exchange.
+    ///
+    /// The fingerprint is derived by hashing the SQS components, phase lock, and
+    /// participant IDs in a deterministic order.
+    ///
+    /// # Returns
+    /// * `Ok(String)` containing a short hexadecimal fingerprint (e.g., 8 characters).
+    /// * `Err(QfeError::SqsMissing)` if no SQS has been established for this frame.
+    /// * `Err(QfeError::FrameInvalid)` if the frame is in an invalid state.
+    pub fn calculate_sqs_fingerprint(&self) -> Result<String, QfeError> {
+        if !self.is_valid() { return Err(QfeError::FrameInvalid); }
+        let sqs = self.get_sqs().ok_or(QfeError::SqsMissing)?;
+
+        let mut hasher = Sha512::new(); // Use strong hash for fingerprint base
+        hasher.update(b"QFE_SQS_FINGERPRINT_V1"); // Domain separation
+
+        // Include participant IDs, sorted for consistency
+        let mut ids = [sqs.participant_a_id.as_str(), sqs.participant_b_id.as_str()];
+        ids.sort_unstable();
+        hasher.update(ids[0].as_bytes());
+        hasher.update(ids[1].as_bytes());
+
+        // Include core SQS data
+        hasher.update(&sqs.components);
+        hasher.update(sqs.shared_phase_lock.to_le_bytes());
+        hasher.update(sqs.resonance_freq.to_le_bytes()); // Include for context
+
+        let full_hash: [u8; 64] = hasher.finalize().into();
+
+        // Take the first 4 bytes (8 hex chars) for a short fingerprint
+        // Use data encoding crate for hex? No, keep deps minimal. Format manually.
+        let fingerprint = format!(
+            "{:02x}{:02x}{:02x}{:02x}",
+            full_hash[0], full_hash[1], full_hash[2], full_hash[3]
+        );
+
+        Ok(fingerprint)
+    }
 }
 
 // --- Public API Functions ---
@@ -473,6 +521,14 @@ pub fn setup_qfe_pair(
 ///     - Either frame is already invalid (`QfeError::FrameInvalid`).
 ///     - An SQS is already established for one or both frames (`QfeError::SqsEstablishmentFailed`).
 ///     - The simulated interaction fails internal checks (`QfeError::SqsEstablishmentFailed`).
+///
+/// Performs the interactive shared state (`SQS`) establishment process between two Frames.
+/// This simulates the key exchange. After calling this successfully, it is **highly recommended**
+/// that both participants call [`Frame::calculate_sqs_fingerprint`] and compare the results
+/// via an independent, authenticated channel (e.g., voice call, in person) to verify
+/// the absence of a Man-in-the-Middle attack before using the SQS for sensitive communication.
+///
+/// (Rest of documentation comment remains the same)
 pub fn establish_sqs(frame_a: &mut Frame, frame_b: &mut Frame) -> Result<(), QfeError> {
     if !frame_a.validation_status || !frame_b.validation_status {
          return Err(QfeError::FrameInvalid);
@@ -483,10 +539,13 @@ pub fn establish_sqs(frame_a: &mut Frame, frame_b: &mut Frame) -> Result<(), Qfe
         ));
     }
 
-    let aspect_a = frame_a.calculate_interaction_aspect(); // Still u64 for now
-    let aspect_b = frame_b.calculate_interaction_aspect(); // Still u64 for now
+    let aspect_a = frame_a.calculate_interaction_aspect();
+    let aspect_b = frame_b.calculate_interaction_aspect();
 
-    // CHANGED: Use SHA-512 based derivation for SQS components
+    // Use SHA-512 based derivation for SQS components
+    // CHANGED: Capture IDs before moving frames into function if needed, or clone IDs.
+    let id_a = frame_a.id.clone();
+    let id_b = frame_b.id.clone();
     let shared_components = derive_shared_components_sha512(aspect_a, frame_a.phase, aspect_b, frame_b.phase);
 
     // Phase lock calculation remains the same
@@ -496,19 +555,22 @@ pub fn establish_sqs(frame_a: &mut Frame, frame_b: &mut Frame) -> Result<(), Qfe
     let shared_phase_lock = (frame_a.phase * weight_a + frame_b.phase * weight_b) / total_weight;
     let shared_phase_lock = shared_phase_lock.rem_euclid(2.0 * std::f64::consts::PI);
 
-    // Validation checks remain the same conceptually, but C3 now checks 64 bytes
+    // Validation checks
     let c1_check = shared_phase_lock.is_finite();
-    let c3_check = !shared_components.is_empty() && shared_components.len() == 64; // Check for 64 bytes from SHA-512
+    let c3_check = !shared_components.is_empty() && shared_components.len() == 64; // Expect 64 bytes
 
     let validation_passed = c1_check && c3_check;
 
     if validation_passed {
         let sqs = Arc::new(Sqs {
             pattern_type: PatternType::Sqs,
-            components: shared_components, // Now contains 64 bytes
+            components: shared_components,
             shared_phase_lock,
             resonance_freq: RESONANCE_FREQ,
             validation: true,
+            // --- NEW: Populate participant IDs ---
+            participant_a_id: id_a, // Store IDs used in this SQS
+            participant_b_id: id_b,
         });
         frame_a.sqs_component = Some(Arc::clone(&sqs));
         frame_b.sqs_component = Some(sqs);
@@ -517,7 +579,7 @@ pub fn establish_sqs(frame_a: &mut Frame, frame_b: &mut Frame) -> Result<(), Qfe
         frame_a.validation_status = false;
         frame_b.validation_status = false;
         Err(QfeError::SqsEstablishmentFailed(format!(
-            "Validation failed: PhaseCoherenceCheck(ValidNumber)={}, PatternResonanceCheck(NonTrivial SHA512)={}", // Updated msg
+            "Validation failed: PhaseCoherenceCheck(ValidNumber)={}, PatternResonanceCheck(SHA512_64Bytes)={}",
             c1_check, c3_check
         )))
     }
@@ -864,5 +926,57 @@ mod tests {
          let result = frame_no_sqs.decode(&encoded_signal);
          assert!(result.is_err());
          assert_eq!(result.unwrap_err(), QfeError::SqsMissing);
+    }
+
+    /// Tests the SQS fingerprint generation for OOB authentication.
+    #[test]
+    fn test_sqs_fingerprint_consistency_and_errors() {
+        // Setup two frames
+        let mut frame_a = Frame::initialize("FrameA_OOB".to_string(), 202504051);
+        let mut frame_b = Frame::initialize("FrameB_OOB".to_string(), 202504052);
+        let frame_c_no_sqs = Frame::initialize("FrameC_NoSQS".to_string(), 202504053);
+
+        // Case 1: Error when SQS is not established
+        let fp_err_a = frame_a.calculate_sqs_fingerprint();
+        assert!(fp_err_a.is_err());
+        assert!(matches!(fp_err_a.unwrap_err(), QfeError::SqsMissing));
+
+        let fp_err_c = frame_c_no_sqs.calculate_sqs_fingerprint();
+        assert!(fp_err_c.is_err());
+        assert!(matches!(fp_err_c.unwrap_err(), QfeError::SqsMissing));
+
+
+        // Case 2: Establish SQS successfully
+        let establish_result = establish_sqs(&mut frame_a, &mut frame_b);
+        assert!(establish_result.is_ok());
+        assert!(frame_a.has_sqs());
+        assert!(frame_b.has_sqs());
+
+        // Case 3: Calculate fingerprints for both frames
+        let fp_a_res = frame_a.calculate_sqs_fingerprint();
+        let fp_b_res = frame_b.calculate_sqs_fingerprint();
+
+        assert!(fp_a_res.is_ok());
+        assert!(fp_b_res.is_ok());
+
+        let fp_a = fp_a_res.unwrap();
+        let fp_b = fp_b_res.unwrap();
+
+        println!("Frame A Fingerprint: {}", fp_a);
+        println!("Frame B Fingerprint: {}", fp_b);
+
+        // Assert fingerprints are not empty and are equal
+        assert!(!fp_a.is_empty(), "Fingerprint A should not be empty");
+        assert!(!fp_b.is_empty(), "Fingerprint B should not be empty");
+        // Fingerprint length should be 8 hex chars (4 bytes) based on current impl
+        assert_eq!(fp_a.len(), 8, "Fingerprint A has unexpected length");
+        assert_eq!(fp_b.len(), 8, "Fingerprint B has unexpected length");
+        assert_eq!(fp_a, fp_b, "Fingerprints for the same SQS should match");
+
+        // Case 4: Error when frame is invalid
+        frame_a.validation_status = false; // Manually invalidate frame
+        let fp_err_invalid = frame_a.calculate_sqs_fingerprint();
+        assert!(fp_err_invalid.is_err());
+        assert!(matches!(fp_err_invalid.unwrap_err(), QfeError::FrameInvalid));
     }
 }

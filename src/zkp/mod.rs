@@ -98,6 +98,7 @@ pub fn establish_zkp_sqs(
         shared_phase_lock,
         resonance_freq: RESONANCE_FREQ,
         validation: true, // Derived directly, assume valid structure
+        ..Default::default()
     };
     if sqs.components.len() != 64 {
          return Err(QfeError::InternalError(format!(
