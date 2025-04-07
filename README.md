@@ -2,26 +2,27 @@
 
 # Qualitative Frame Entanglement (QFE)
 
-This repository contains a Rust implementation simulating an experimental protocol for secure communication, referred to here as 'QFE'. The protocol relies on establishing a unique shared state (`SQS`) between two parties (represented as `Frame`s) and uses stateful, modulated encoding with built-in integrity checks designed to detect tampering.
+QFE establishessecure communication sessions by integrating standard, modern cryptographic primitives. Key
+establishment leverages the NIST standard post-quantum key encapsulation mechanism ML-KEM-1024 (Kyber) to generate a shared secret resistant to known quantum computing attacks.
+
 
 **Disclaimer:** This library is an experimental simulation based on conceptual principles. It has **not** undergone formal security analysis or peer review and should **not** be considered cryptographically secure or suitable for production use cases involving sensitive data.
 
-## Core Concepts
-
-* **Frames:** Represent communication participants (`Frame` struct).
-* **Shared Qualitative Structure (SQS):** A shared secret context (`SQS` struct) established between two Frames via an interactive process (`establish_sqs` or `setup_qfe_pair`). Contains secret components and synchronization parameters (like `shared_phase_lock`).
-* **Stateful Encoding/Decoding:** Messages are encoded sequentially (`encode`/`encode_str`), where each output unit (`EncodedUnit`) depends on the previous state (phase) and the SQS. Decoding (`decode`/`decode_to_str`) reverses this process.
-* **Integrity Verification:** Each `EncodedUnit` contains an integrity hash calculated using the original data and the `SQS` components. The decoding process verifies this hash, causing decoding to fail if tampering or context mismatch (wrong SQS) is detected.
 
 ## Features
 
-* Initialization of participant `Frame`s.
-* Establishment of a shared secret state (`SQS`) between two `Frame`s.
-* Encoding of byte arrays (`&[u8]`) and string slices (`&str`).
-* Decoding of encoded signals back into byte arrays or `String`s.
-* Built-in detection of tampering via integrity checks during decoding.
-* Structured error handling using the `QfeError` enum.
-* Basic API for simplified setup (`setup_qfe_pair`).
+* ML-KEM-1024 (Kyber): The NIST standard Key Encapsulation Mechanism for post-
+quantum secure key establishment, protecting the initial shared secret against attacks from
+both classical and future quantum computers.
+* HKDF-SHA512: The standard HMAC-based Key Derivation Function (RFC 5869) to
+derive specific cryptographic keys (e.g., for AEAD) from the master shared secret generated
+by ML-KEM.
+* ChaCha20-Poly1305: A standard, high-performance Authenticated Encryption with Asso-
+ciated Data (AEAD) cipher (RFC 8439) providing confidentiality, data integrity, and message
+authenticity for all communications subsequent to key establishment.
+* SHA-512: Used for cryptographic hashing during Frame initialization, key derivation (within
+HKDF), and potentially within Zero-Knowledge Proof components.
+
 
 ## Tests
 
@@ -38,114 +39,92 @@ cargo run --example hello
 ```
 
 ```rust
-// qfe/examples/hello.rs
+// examples/qfe_comprehensive.rs
 
-// Import necessary items from the qfe library crate
-use qfe::{setup_qfe_pair, QfeError}; // Use setup_qfe_pair and the error type
+//! A comprehensive example demonstrating various QFE functionalities:
+//! 1. SQS Establishment between two parties (Alice and Bob).
+//! 2. AEAD Encryption/Decryption using ChaCha20-Poly1305.
+//! 3. Examples of error handling for tampering and wrong context.
+
+use qfe::{
+    Frame,
+    QfeError,
+    establish_sqs_kem,
+};
 use std::error::Error;
 
-fn main() -> Result<(), Box<dyn Error>> { // Use standard result type for main
-    println!("--- QFE 'Hello, world!' Example ---");
+fn main() -> Result<(), Box<dyn Error>> {
+    // Get current date for context
+    // Note: This uses chrono which might not be a dependency.
+    // For simplicity, we'll just use a fixed string or skip it.
+    // Alternatively, could use std::time, but that's more complex for formatting.
+    // Let's use a placeholder date for the example output.
+    let current_date_str = "2025-04-06"; // Placeholder for Sunday, April 6, 2025
+    println!("--- QFE Comprehensive Example ({}) ---", current_date_str);
 
-    // 1. Setup communication pair using the simplified API
-    println!("\n[1] Initializing Frames and establishing SQS...");
-    let (frame_a, mut frame_b) = match setup_qfe_pair(
-        "Frame_A".to_string(), // ID for Frame A
-        20250330,             // Seed for Frame A
-        "Frame_B".to_string(), // ID for Frame B
-        115702,             // Seed for Frame B
-    ) {
-        Ok(pair) => {
-            println!("    Frames A & B initialized and SQS established successfully.");
-            pair
-        }
-        Err(e) => {
-            eprintln!("    Error setting up QFE pair: {}", e);
-            return Err(Box::new(e)); // Convert QfeError to Box<dyn Error>
-        }
-    };
+    // --- 1. Setup and SQS Establishment ---
+    println!("\n[1] Initializing Frames and Establishing SQS...");
+    let alice_id = "Alice";
+    let bob_id = "Bob";
+    // Use different seeds for Alice and Bob
+    let mut frame_a = Frame::initialize(alice_id.to_string());
+    let mut frame_b = Frame::initialize(bob_id.to_string());
+    println!("    Initialized Frame for {} and {}", alice_id, bob_id);
 
-    // Optional: Display some info about the frames/SQS
-     println!("    Frame A Valid: {}", frame_a.is_valid());
-     // println!("    Frame A SQS Components Hash: {:x}", {
-     //     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-     //     frame_a.get_sqs().unwrap().components.hash(&mut hasher);
-     //     hasher.finish()
-     // });
+    establish_sqs_kem(&mut frame_a, &mut frame_b, "hello")
+        .map_err(|e| format!("SQS Establishment between {} and {} failed: {}", alice_id, bob_id, e))?;
+    println!("    SQS established successfully between {} and {}.", alice_id, bob_id);
+    assert!(frame_a.has_sqs() && frame_b.has_sqs());
 
-    // 2. Define the message
-    let original_message = "Hello, world!";
-    println!("\n[2] Original Message: '{}'", original_message);
+    // --- 2. AEAD Encrypt (Alice) / Decrypt (Bob) ---
+    println!("\n[2] Demonstrating AEAD Encryption/Decryption...");
+    let plaintext1 = b"Secret message protected by AEAD!";
+    let associated_data1 = Some(b"Context_ID_123" as &[u8]); // Optional authenticated data
+    println!("    {} wants to send: '{}'", alice_id, String::from_utf8_lossy(plaintext1));
+    println!("    Using Associated Data: '{}'", String::from_utf8_lossy(associated_data1.unwrap()));
 
-    // 3. Encode the message using Frame A's convenience method
-    println!("\n[3] Frame A encoding message...");
-    let encoded_signal = match frame_a.encode_str(original_message) {
-        Ok(signal) => {
-            println!("    Encoding successful. Signal length: {}", signal.len());
-             if !signal.is_empty() {
-                 // Display first unit hash for visualization
-                 println!("    First Encoded Unit Hash: {:?}", signal[0].integrity_hash);
-             }
-            signal
-        }
-        Err(e) => {
-            eprintln!("    Error during encoding: {}", e);
-            return Err(Box::new(e));
-        }
-    };
+    // Alice Encodes
+    let encrypted_msg = frame_a.encode_aead(plaintext1, associated_data1)
+        .map_err(|e| format!("{} failed to encode AEAD: {}", alice_id, e))?;
+    println!("    {} encoded message (Nonce: {:x?}, Ciphertext+Tag length: {} bytes)",
+        alice_id,
+        &encrypted_msg.nonce[..4], // Show first few bytes of nonce
+        encrypted_msg.ciphertext.len()
+    );
 
-    // 4. Decode the message using Frame B's convenience method
-    println!("\n[4] Frame B decoding signal...");
-    let decoded_message = match frame_b.decode_to_str(&encoded_signal) {
-        Ok(msg) => {
-            println!("    Decoding successful.");
-            msg
-        }
-        Err(e) => {
-            eprintln!("    Error during decoding: {}", e);
-            // Even if decoding fails, check frame B's validity state
-            println!("    Frame B Valid after failed decode attempt: {}", frame_b.is_valid());
-            return Err(Box::new(e));
-        }
-    };
-    println!("    Decoded Message: '{}'", decoded_message);
+    // Bob Decodes
+    let decoded_plaintext = frame_b.decode_aead(&encrypted_msg, associated_data1)
+         .map_err(|e| format!("{} failed to decode AEAD: {}", bob_id, e))?;
+    println!("    {} decoded message: '{}'", bob_id, String::from_utf8_lossy(&decoded_plaintext));
 
-    // 5. Verify the result
-    println!("\n[5] Verifying result...");
-    assert_eq!(original_message, decoded_message, "Mismatch between original and decoded message!");
-    println!("    Success! Decoded message matches original.");
-    println!("    Frame B Valid after successful decode: {}", frame_b.is_valid());
+    // Verify
+    assert_eq!(plaintext1, decoded_plaintext.as_slice());
+    println!("    SUCCESS: AEAD decoded message matches original plaintext.");
+    assert!(frame_b.is_valid()); // Bob's frame should still be valid
 
+    // --- 3. Error Handling Examples ---
 
-    // 6. Tamper Detection Demonstration
-    println!("\n[6] Tamper Detection Demo...");
-    let mut tampered_signal = encoded_signal.clone();
-    if !tampered_signal.is_empty() {
-        println!("    Tampering with integrity hash of first signal unit...");
-        tampered_signal[0].integrity_hash[0] ^= 0x01; // Corrupt hash
+    println!("\n[3] Error Example: Tampered AEAD Ciphertext...");
+    let plaintext3 = b"Another secret";
+    let mut encrypted_msg_tampered = frame_a.encode_aead(plaintext3, None)?;
+    println!("    {} encoded message: (Nonce: {:x?}, CT Len: {})", alice_id, &encrypted_msg_tampered.nonce[..4], encrypted_msg_tampered.ciphertext.len());
+    // Tamper
+    if !encrypted_msg_tampered.ciphertext.is_empty() {
+        encrypted_msg_tampered.ciphertext[0] ^= 0xFF; // Flip bits at start
+        println!("    Ciphertext tampered!");
+    }
+    // Bob attempts decode
+    let decode_tampered_res = frame_b.decode_aead(&encrypted_msg_tampered, None);
+    assert!(decode_tampered_res.is_err());
+    if let Err(QfeError::DecodingFailed(msg)) = decode_tampered_res {
+         println!("    SUCCESS: {} correctly failed to decode tampered AEAD message: {}", bob_id, msg);
+         assert!(!frame_b.is_valid(), "Bob's frame should be invalid after failed AEAD decode");
+         println!("    {}'s frame validity: {}", bob_id, frame_b.is_valid());
+    } else {
+         panic!("Expected DecodingFailed error, got {:?}", decode_tampered_res.err());
     }
 
-    println!("    Frame B attempting to decode tampered signal...");
-    match frame_b.decode_to_str(&tampered_signal) {
-        Ok(msg) => {
-             // This should NOT happen
-             eprintln!("    ERROR: Decoding tampered signal succeeded unexpectedly! Decoded: '{}'", msg);
-             return Err("Tamper detection failed!".into()); // Use basic error conversion
-        }
-        Err(e) => {
-             println!("    Successfully detected tampering!");
-             println!("    Decode error reported: {}", e);
-             match e {
-                 QfeError::DecodingFailed(_) => println!("    Error type is correctly DecodingFailed."),
-                 _ => eprintln!("    WARNING: Incorrect error type reported for tamper detection: {:?}", e),
-             }
-             // Crucially, check if Frame B was marked invalid
-             assert!(!frame_b.is_valid(), "Frame B should be marked invalid after detecting tampering");
-             println!("    Frame B validation status correctly set to: {}", frame_b.is_valid());
-        }
-    }
-
-    println!("\n--- QFE Example Complete ---");
+    println!("\n--- QFE Comprehensive Example Complete ---");
     Ok(())
 }
 ```

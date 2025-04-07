@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // --- Setup ---
     println!("\n[1] Setup Phase:");
-    let mut prover = Frame::initialize("SchnorrProverExample".to_string(), 202504063);
+    let mut prover = Frame::initialize("SchnorrProverExample".to_string());
     let verifier_id_for_sqs = "SchnorrVerifierExample_SQS_ID"; // Only needed if using SQS
     println!("    Prover Frame initialized.");
 

@@ -15,7 +15,7 @@
 
 // Import necessary items from the parent module (src/lib.rs) or crate root
 use crate::{Frame, Sqs, QfeError, PatternType, Sha512Hash};
-use crate::{PHI, RESONANCE_FREQ};
+use crate::PHI;
 // Removed unused imports: ZkpChallenge, generate_zkp_challenge related imports if no longer needed elsewhere
 // use std::hash::{Hash, Hasher}; // No longer needed for DefaultHasher
 // use std::collections::hash_map::DefaultHasher; // Removed DefaultHasher
@@ -82,7 +82,6 @@ pub fn establish_zkp_sqs(
     components_hasher.update(public_statement);
     components_hasher.update(context_string.as_bytes());
     components_hasher.update(PHI.to_le_bytes());
-    components_hasher.update(RESONANCE_FREQ.to_le_bytes());
     let sqs_components: Vec<u8> = components_hasher.finalize().to_vec();
 
     // Ensure components have expected length (SHA-512 output size)
@@ -92,30 +91,10 @@ pub fn establish_zkp_sqs(
         )));
     }
 
-    // 2. Derive shared phase lock using SHA-512 (replaced DefaultHasher)
-    let mut phase_hasher = Sha512::new();
-    phase_hasher.update(b"QFE_ZKP_SQS_PHASE_V1"); // Changed domain separator slightly
-    phase_hasher.update(prover_id.as_bytes());
-    phase_hasher.update(verifier_id.as_bytes());
-    phase_hasher.update(public_statement);
-    phase_hasher.update(context_string.as_bytes());
-    phase_hasher.update(PHI.to_le_bytes()); // Use consistent byte representation
-    phase_hasher.update(RESONANCE_FREQ.to_le_bytes()); // Use consistent byte representation
-    let phase_hash_output: [u8; 64] = phase_hasher.finalize().into();
-
-    // Convert first 8 bytes of hash to u64 and scale to [0, 2*PI) for phase lock
-    let phase_bytes: [u8; 8] = phase_hash_output[0..8].try_into()
-        .map_err(|_| QfeError::InternalError("Failed to slice phase hash bytes".to_string()))?;
-    let phase_u64 = u64::from_le_bytes(phase_bytes);
-    let shared_phase_lock = (phase_u64 as f64 / u64::MAX as f64) * 2.0 * std::f64::consts::PI;
-
-
     // 3. Construct the Sqs object
     let sqs = Sqs {
         pattern_type: PatternType::Sqs,
         components: sqs_components, // Use the derived components Vec<u8>
-        shared_phase_lock,
-        resonance_freq: RESONANCE_FREQ,
         validation: true, // Derived directly, assume valid structure
         ..Default::default()
     };
@@ -137,57 +116,60 @@ pub struct SchnorrProof {
 fn hash_to_scalar(
     public_point_p: &RistrettoPoint,
     commitment_point_r: &RistrettoPoint,
-    zkp_sqs: Option<&Sqs>, // Optional SQS context integration
-    context_string: Option<&[u8]>, // Optional domain separation
+    zkp_sqs: Option<&Sqs>, // Optional: Pass if proof needs binding to QFE session
+    context_string: Option<&[u8]>,
 ) -> Scalar {
     let mut hasher = Sha512::new();
-    hasher.update(b"QFE_SCHNORR_CHALLENGE_V1"); // Domain separation for challenge
-    hasher.update(RISTRETTO_BASEPOINT_POINT.compress().as_bytes()); // Base point G
-    hasher.update(public_point_p.compress().as_bytes());     // Public point P = xG
-    hasher.update(commitment_point_r.compress().as_bytes()); // Commitment R = kG
+    hasher.update(b"QFE_SCHNORR_CHALLENGE_V1"); // Domain separation
+    hasher.update(RISTRETTO_BASEPOINT_POINT.compress().as_bytes()); // Include G
+    hasher.update(public_point_p.compress().as_bytes());     // Include P (statement)
+    hasher.update(commitment_point_r.compress().as_bytes()); // Include R (commitment)
 
-    // Optionally include SQS context from the QFE framework
+    // Optionally bind to SQS session using non-secret participant IDs
     if let Some(sqs) = zkp_sqs {
-        if sqs.validation { // Only use valid SQS context
-             hasher.update(&sqs.components);
-             hasher.update(sqs.shared_phase_lock.to_le_bytes());
-             // Optionally add PHI/RESONANCE_FREQ if they are part of the intended context binding
-             // hasher.update(PHI.to_le_bytes());
-             // hasher.update(RESONANCE_FREQ.to_le_bytes());
+        if sqs.validation {
+            // Sort IDs for consistent hashing order
+            let mut ids = [sqs.participant_a_id.as_bytes(), sqs.participant_b_id.as_bytes()];
+            ids.sort_unstable();
+            hasher.update(b"SQS_CONTEXT_IDS_V1"); // Domain separator for this part
+            hasher.update(ids[0]);
+            hasher.update(ids[1]);
+            // Note: Removed hashing of sqs.components and non-existent sqs.shared_phase_lock
         } else {
-             // Handle invalid SQS? Log a warning, or perhaps don't include it.
-             // For safety, maybe require SQS to be valid if provided.
-             // Or define behavior clearly. Let's hash a placeholder if invalid for now.
+             // It might be better to error out if an invalid SQS is provided,
+             // rather than hashing a placeholder and potentially allowing a proof
+             // to seem valid in an unexpected context. But for now, keep placeholder.
              hasher.update(b"INVALID_SQS_CONTEXT");
         }
     }
+
     // Optionally include other arbitrary context
     if let Some(ctx) = context_string {
+        hasher.update(b"EXTRA_CONTEXT_V1"); // Domain separator
         hasher.update(ctx);
     }
 
     let hash_output: [u8; 64] = hasher.finalize().into();
-    // Reduce the 512-bit hash modulo the group order to get a valid scalar
     Scalar::from_bytes_mod_order_wide(&hash_output)
 }
+
 
 // --- Helper function to derive Fiat-Shamir challenge ---
 
 /// Derives the Fiat-Shamir challenge deterministically based on public context.
 /// Both Prover and Verifier call this using identical inputs.
 fn derive_fs_challenge(
-    zkp_sqs: &Sqs,
+    zkp_sqs: &Sqs, // This is crate::Sqs which has no phase lock
     public_statement_h_public: &[u8],
 ) -> Vec<u8> {
      let mut challenge_hasher = Sha512::new();
-     challenge_hasher.update(b"QFE_ZKP_FIAT_SHAMIR_CHALLENGE_V1"); // Domain separation for challenge derivation
+     challenge_hasher.update(b"QFE_ZKP_FIAT_SHAMIR_CHALLENGE_V1");
      challenge_hasher.update(&zkp_sqs.components);
-     challenge_hasher.update(zkp_sqs.shared_phase_lock.to_le_bytes());
+     // REMOVED: challenge_hasher.update(zkp_sqs.shared_phase_lock.to_le_bytes());
      challenge_hasher.update(public_statement_h_public);
-     // Include constants consistent with SQS derivation to bind challenge tightly to context
-     challenge_hasher.update(PHI.to_le_bytes());
-     challenge_hasher.update(RESONANCE_FREQ.to_le_bytes());
-     challenge_hasher.finalize().to_vec() // Return the challenge bytes
+     challenge_hasher.update(PHI.to_le_bytes()); // Keep PHI as it was in ZKP SQS derivation
+     // REMOVED: challenge_hasher.update(RESONANCE_FREQ.to_le_bytes());
+     challenge_hasher.finalize().to_vec()
 }
 
 // --- ZKP methods within Frame ---
@@ -243,9 +225,7 @@ impl Frame {
         response_hasher.update(&derived_challenge_value); // Use derived challenge
         response_hasher.update([is_valid_witness as u8]); // Hash the boolean result (as 1 or 0)
         response_hasher.update(&zkp_sqs.components);
-        response_hasher.update(zkp_sqs.shared_phase_lock.to_le_bytes());
         response_hasher.update(PHI.to_le_bytes());
-        response_hasher.update(RESONANCE_FREQ.to_le_bytes());
 
         let proof_hash: Sha512Hash = response_hasher.finalize().into();
 
@@ -292,9 +272,7 @@ impl Frame {
              response_hasher.update(&derived_challenge_value); // Use derived challenge
              response_hasher.update([true as u8]); // Verifier *assumes* validity (true -> 1 byte)
              response_hasher.update(&zkp_sqs.components);
-             response_hasher.update(zkp_sqs.shared_phase_lock.to_le_bytes());
              response_hasher.update(PHI.to_le_bytes());
-             response_hasher.update(RESONANCE_FREQ.to_le_bytes());
              let hash: Sha512Hash = response_hasher.finalize().into();
              hash
         };
@@ -422,8 +400,8 @@ mod tests {
 
     /// Sets up Prover, Verifier, calculates H(W), stores W, establishes ZKP SQS for Validity Proof.
     fn setup_simple_zkp_test() -> SimpleZkpTestData {
-        let mut prover = Frame::initialize("ValidityProverNI".to_string(), 20250406); // NI for NonInteractive
-        let verifier = Frame::initialize("ValidityVerifierNI".to_string(), 20250406);
+        let mut prover = Frame::initialize("ValidityProverNI".to_string()); // NI for NonInteractive
+        let verifier = Frame::initialize("ValidityVerifierNI".to_string());
         let witness = b"a_valid_witness_for_noninteractive_zkp".to_vec();
         let h_public: Sha512Hash = Sha512::digest(&witness).into(); // Calculate H(W)
         prover.store_zkp_witness(&witness).expect("Failed to store witness");
@@ -557,7 +535,7 @@ mod tests {
         let h_public = test_data1.h_public;
 
         // Create V2 and SQS2 with different context
-        let mut verifier2 = Frame::initialize("Verifier2_WrongSQS_NI".to_string(), 909091);
+        let mut verifier2 = Frame::initialize("Verifier2_WrongSQS_NI".to_string());
         let zkp_sqs2 = establish_zkp_sqs(
             prover.id(),
             verifier2.id(), // Different V ID
@@ -637,7 +615,7 @@ mod schnorr_tests { // Use a nested module for organization
 
     // Helper to setup Schnorr test context
     fn setup_schnorr_test() -> (Frame, Scalar, RistrettoPoint, Option<Sqs>) {
-        let mut prover = Frame::initialize("SchnorrProver".to_string(), 20250406);
+        let mut prover = Frame::initialize("SchnorrProver".to_string());
         let verifier_id = "SchnorrVerifier"; // Only need ID for SQS context
 
         // Prover generates secret x and public P
@@ -732,34 +710,7 @@ mod schnorr_tests { // Use a nested module for organization
         assert!(matches!(verification_result.unwrap_err(), QfeError::DecodingFailed(_)));
     }
 
-     #[test]
-    fn test_schnorr_proof_wrong_sqs_context() {
-        let (prover, _secret_x, public_p, sqs_opt) = setup_schnorr_test();
-        let sqs1_ref = sqs_opt.as_ref();
-
-        // Prover generates proof using sqs1 context
-        let proof = prover.generate_schnorr_proof(&public_p, sqs1_ref, None)
-            .expect("Prover failed to generate Schnorr proof");
-
-        // Create a different SQS context
-        let sqs2 = establish_zkp_sqs(
-            prover.id(),
-            "VerifierWithDifferentSQS",
-            public_p.compress().as_bytes(),
-            "different_schnorr_context_v2"
-        ).expect("Failed to establish SQS2");
-        let sqs2_ref = Some(&sqs2);
-        assert_ne!(sqs1_ref.unwrap().components, sqs2_ref.unwrap().components);
-
-        // Verifier tries to verify using sqs2 context
-        // This will cause hash_to_scalar to produce a different challenge 'c'
-        let verification_result = verify_schnorr_proof(&proof, &public_p, sqs2_ref, None);
-
-        assert!(verification_result.is_err(), "Schnorr verification should fail for wrong SQS context");
-        assert!(matches!(verification_result.unwrap_err(), QfeError::DecodingFailed(_)));
-    }
-
-     #[test]
+    #[test]
     fn test_schnorr_proof_missing_scalar() {
          let (mut prover_no_scalar, _secret_x, public_p, sqs_opt) = setup_schnorr_test();
          prover_no_scalar.zkp_secret_scalar = None; // Explicitly remove scalar

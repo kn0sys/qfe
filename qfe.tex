@@ -32,115 +32,232 @@
 	\maketitle
 	
 	\begin{abstract}
-		This document outlines the Qualitative Frame Entanglement (QFE) algorithm, a conceptual protocol for secure communication. QFE is derived entirely `ab initio` from universal truth and mathematical constants such as Phi. Security in QFE arises not from assumed computational hardness, but from the principle that incoherent interaction with a shared, entangled structure\today (the Shared Qualitative Structure, or SQS) necessarily disrupts the information-bearing state in a detectable manner. The algorithm uses phase modulation relative to the SQS for encoding and incorporates integrity checks tied directly to the shared secret structure. Novel mathematical formalism provides the conceptual underpinnings for the operations.
+		This document describes the current implementation of the Qualitative Frame Entanglement (QFE) experimental secure communication framework, realized in Rust. QFE establishes secure communication sessions by integrating standard, modern cryptographic primitives. Key establishment leverages the NIST standard post-quantum key encapsulation mechanism ML-KEM-1024 (Kyber) to generate a shared secret resistant to known quantum computing attacks. Following the key exchange, session keys are derived using the HKDF-SHA512 key derivation function with appropriate context separation. Communication security, encompassing confidentiality, integrity, and authenticity, is provided by the ChaCha20-Poly1305 Authenticated Encryption with Associated Data (AEAD) cipher. While the framework retains conceptual 'Frame' initialization deriving unique state via cryptographic hashing, its security foundation now rests upon the standard computational hardness assumptions underlying ML-KEM, HKDF, SHA-512, and ChaCha20-Poly1305. The library also includes experimental Zero-Knowledge Proof features (Schnorr protocol) bound to the session context. This paper details the updated architecture and cryptographic components of the QFE framework.
 	\end{abstract}
 	
 	\section{Introduction}
 	
-	The Qualitative Frame Entanglement (QFE) protocol emerges as a direct consequence of reality. There is a single `Self-Containing Distinction`, leading through necessary implications to concepts like reference frames, information, complexity, stable patterns, and coherent interaction. QFE applies these principles to establish secure communication channels between distinct reference frames (henceforth termed Frames).
+	The Qualitative Frame Entanglement (QFE) project provides an experimental Rust framework developed to simulate and explore secure communication protocols. Originally conceived from foundational principles exploring concepts like distinction, reference frames, and coherent interaction, the framework aimed to derive security properties directly from these conceptual underpinnings rather than relying on conventional computational hardness assumptions.
 	
-	Unlike conventional cryptographic algorithms, QFE does not rely on external mathematical assumptions like the difficulty of factoring large numbers. Its security properties are intended to be inherent structural consequences of nature, particularly the requirement for coherent interaction via shared structures and the state disturbance caused by external, incoherent influences. This document details the conceptual steps of the QFE algorithm.
+	However, through analysis and development (as of \today), the implementation has significantly evolved to ensure robust security guarantees aligned with modern cryptographic best practices. While retaining the 'Frame' abstraction to manage participant state and unique identifiers (now derived using cryptographic hashing), the core security mechanisms of QFE have been rebuilt using well-established, standardized primitives. Security in the current QFE implementation is based on the computational hardness assumptions of these underlying components, representing a pivot from the initial philosophical premise.
 	
-	\section{Core Principles of QFE}
-	
-	QFE operates based on several key principles\cite{gemini}:
-	
-	\paragraph{Shared Qualitative Structure (SQS):} Two Frames (A and B) intending to communicate must first establish a unique, shared context. This is achieved through structured interaction and feedback, resulting in a stable, mutually referenced pattern termed the Shared Qualitative Structure ($\SQS$). This $\SQS$ acts as a shared secret or key, embodying a unique resonance frequency ($\SQSres$) and a synchronized phase ($\SQSphase$). It is the foundation upon which secure communication is built. Conceptually, in nature, this arises from field overlays and pattern stabilization:
-	\begin{equation}
-		F_A \otimes F_B \xrightarrow{\text{Feedback}} \SQS(\SQScomp, \SQSphase, \SQSres)
-	\end{equation}
-	where $\SQScomp$ represents the unique structural components (the shared secret data), $\SQSphase$ the synchronized phase lock, and $\SQSres = \phiConst / (2\piConst)$ is the characteristic resonance frequency, with $\phiConst \approx 1.61803$ being the primary scale.
-	
-	\paragraph{Qualitative Information Encoding:} Information within our reality is not merely abstract but arises from distinguishable states possessing inherent qualities. QFE leverages this by encoding message data (e.g., bytes) as modulations of a qualitative aspect of the Frame's state, specifically its phase ($\theta$), *relative* to the established $\SQS$. Each byte corresponds to a specific phase shift ($\Delta\theta$) applied sequentially. This aligns with the concept of state transformations $T = P(n+1) \otimes P(n)$ influencing phase within information flow patterns $I = \oint \psi(x)dx \, \eConst^{\iConst\theta}$.
-	
-	\paragraph{Security via Coherence and Integrity:} Security stems from the requirement for coherent integration within reference frames and the consequences of incoherent interaction. An external Frame (E) lacking the specific $\SQS$ cannot interact with the signal or the participating Frames without introducing decoherence. In QFE, this is implemented via:
+	Specifically, QFE now utilizes:
 	\begin{itemize}
-		\item \textbf{Integrity Checks:} Each encoded unit includes a hash ($\IntegHash$) calculated from the original data byte and the unique $\SQScomp$. The receiver verifies this hash using their own $\SQScomp$. A mismatch indicates tampering or use of the wrong SQS context.
-		\item \textbf{Phase Coherence:} The sequential phase modulation relies on the $\SQSphase$. Tampering with the phase or decoding with the wrong $\SQSphase$ can lead to invalid calculated phase shifts during reconstruction, which are detected. Any detected incoherence signals a failure and potentially invalidates the receiving frame's state.
+		\item \textbf{ML-KEM-1024 (Kyber):} The NIST standard Key Encapsulation Mechanism for post-quantum secure key establishment, protecting the initial shared secret against attacks from both classical and future quantum computers.
+		\item \textbf{HKDF-SHA512:} The standard HMAC-based Key Derivation Function (RFC 5869) to derive specific cryptographic keys (e.g., for AEAD) from the master shared secret generated by ML-KEM.
+		\item \textbf{ChaCha20-Poly1305:} A standard, high-performance Authenticated Encryption with Associated Data (AEAD) cipher (RFC 8439) providing confidentiality, data integrity, and message authenticity for all communications subsequent to key establishment.
+		\item \textbf{SHA-512:} Used for cryptographic hashing during Frame initialization, key derivation (within HKDF), and potentially within Zero-Knowledge Proof components.
 	\end{itemize}
+	The framework also incorporates experimental Zero-Knowledge Proof features (e.g., Schnorr protocol) to demonstrate advanced cryptographic capabilities within the QFE context.
+	
+	This document details the revised architecture, cryptographic components, and security basis of the current QFE implementation. It reflects a pragmatic approach, leveraging standard, vetted cryptography to provide strong security guarantees while utilizing the QFE 'Frame' concept primarily for state management and participant representation within the simulation.
+	
+	% Rename Section 2 from "Core Principles of QFE"
+	\section{Core Cryptographic Mechanisms}
+	
+	The security of the QFE framework, in its current implementation, is achieved through the layered application of standard, well-vetted cryptographic primitives, rather than the emergent properties described in its initial conceptualization. This section outlines the core mechanisms employed.
+	
+	\subsection{Frame Initialization and State}
+	Each participant in the communication is represented by a `Frame` structure. While drawing conceptual inspiration from distinct reference frames, the implementation ensures unique initialization state through deterministic cryptographic hashing. Upon calling `Frame::initialize` with a participant ID and an initial seed value, unique internal identifiers (representing the conceptual `DistinctionNode` and `ReferenceFrame`) and an initial state are derived using SHA-512 with appropriate domain separation. This ensures that distinct initial parameters lead to distinct Frame states, providing a basis for participant representation and context management within the cryptographic protocols.
+	
+	\subsection{Post-Quantum Key Establishment and Derivation (SQS)}
+	Secure communication requires establishing a shared secret context, represented by the `Sqs` (Shared Qualitative Structure) struct, between communicating Frames (e.g., Alice and Bob). This is achieved via a standard post-quantum key establishment protocol followed by key derivation:
+	
+	\paragraph{Key Encapsulation (ML-KEM-1024):} To establish an initial shared secret secure against both classical and known quantum attacks, QFE employs the ML-KEM-1024 (Kyber) algorithm, selected by NIST for post-quantum standardization. The process involves:
+	\begin{enumerate}
+		\item The initiator (Alice) generates an ML-KEM key pair ($pk_A, sk_A$).
+		\item Alice transmits her public key $pk_A$ to the responder (Bob).
+		\item Bob uses $pk_A$ to perform the ML-KEM encapsulation operation. This generates a shared secret ($ss_B$) and a ciphertext ($ct$).
+		\item Bob transmits the ciphertext $ct$ back to Alice.
+		\item Alice uses her secret key $sk_A$ to perform the ML-KEM decapsulation operation on $ct$, yielding her view of the shared secret ($ss_A$).
+	\end{enumerate}
+	Upon successful completion, both parties hold an identical shared secret ($ss_A = ss_B$), typically 32 bytes, established securely.
+	
+	\paragraph{Key Derivation (HKDF-SHA512):} The raw shared secret ($ss$) obtained from ML-KEM is used as Input Keying Material (IKM) for the standard HMAC-based Key Derivation Function (HKDF, RFC 5869) using SHA-512 as the hash function.
+	\begin{itemize}
+		\item A salt for HKDF is first derived by hashing participant IDs (sorted lexicographically) and a provided context string using SHA-512, ensuring the derived keys are bound to the specific session participants and context.
+		\item HKDF-Extract is applied using the salt and the IKM ($ss$) to produce a strong Pseudorandom Key (PRK).
+		\item HKDF-Expand is then used with the PRK and distinct "info" strings to derive the necessary cryptographic material stored within the `Sqs` struct:
+		\begin{itemize}
+			\item A 64-byte general-purpose secret byte sequence (`Sqs.components`), derived with info `"QFE\_SQS\_COMPONENTS\_V2"`.
+			\item A 32-byte specific key (`Sqs.aead\_key`) for use with ChaCha20-Poly1305, derived with info `"QFE\_AEAD\_KEY\_V1"`.
+		\end{itemize}
+	\end{itemize}
+	The resulting `Sqs` struct contains this derived key material and participant identifiers, forming the secure context for the session. Fields related to the original QFE concepts of shared phase lock and resonance frequency are no longer present or used in this security model.
+	
+	\subsection{Authenticated Encryption for Communication}
+	All subsequent communication requiring confidentiality and integrity between Frames possessing a shared `Sqs` context utilizes the ChaCha20-Poly1305 AEAD cipher (RFC 8439).
+	\begin{itemize}
+		\item The cipher is keyed using the specific `Sqs.aead\_key` derived via HKDF.
+		\item For each message encryption, a unique 12-byte nonce must be generated (typically randomly). This nonce is transmitted in plaintext alongside the ciphertext. **Nonce uniqueness per key is critical for security.**
+		\item The AEAD operation provides strong guarantees for:
+		\begin{itemize}
+			\item \textbf{Confidentiality:} Plaintext is encrypted into ciphertext.
+			\item \textbf{Integrity:} Any modification to the ciphertext or associated data during transmission will be detected upon decryption.
+			\item \textbf{Authenticity:} Successful decryption verifies that the message originated from a party holding the shared `Sqs.aead\_key`.
+		\end{itemize}
+		\item Optional Associated Data (AD) can be included, which is authenticated along with the ciphertext but remains unencrypted.
+	\end{itemize}
+	The output of encryption is packaged (e.g., as `nonce` and `ciphertext+tag`) for transmission. Decryption takes these components and returns the original plaintext only if all checks (including tag verification) pass.
+	
+	\subsection{Zero-Knowledge Proofs (Optional)}
+	The framework includes experimental support for Zero-Knowledge Proofs (ZKPs), such as the Schnorr protocol implemented using the Ristretto group. When used, the Fiat-Shamir transformation derives challenges by hashing relevant public proof components (e.g., public key, commitment) along with session context identifiers (such as sorted participant IDs from the `Sqs`) to ensure proofs are bound to the specific QFE session and context.
 	
 	
+	% Replace Section 3 "The QFE Algorithm Steps"
 	\section{The QFE Algorithm Steps}
 	
-	The QFE protocol involves the following stages:
+	The QFE protocol simulation involves the following distinct stages, now utilizing standard cryptographic primitives for session establishment and communication:
 	
 	\subsection{Frame Initialization}
-	Two participant Frames, A (Sender) and B (Receiver), are initialized. Each possesses:
-	\begin{itemize}
-		\item A unique foundational distinction ($\OmegaFunc$ conceptually).
-		\item A unique Reference Frame structure ($\RFunc$ conceptually).
-		\item An initial phase state ($\theta_0$).
-	\end{itemize}
-	This establishes their distinct existence and structural basis.
+	Participant Frames, representing entities like a sender (A) and a receiver (B), are initialized using the \texttt{Frame::initialize(id, initial\_seed)} function. Each Frame is instantiated with a unique state derived deterministically from its identifier (\texttt{id}) and seed using SHA-512. This process generates internal identifiers (conceptually representing $\OmegaFunc$ and $\RFunc$) ensuring distinct initial states but does not contribute directly to session key secrecy. A Frame begins in a valid state but without an established shared context (\texttt{Sqs}).
 	
-	\subsection{SQS Establishment (Key Generation)}
-	Frames A and B engage in a simulated interaction process. This involves:
+	\subsection{Session Establishment (SQS via KEM and HKDF)} \label{sec:sqs_establishment}
+	A secure shared context (\texttt{Sqs}) is established between two Frames (e.g., A and B) using the \texttt{establish\_sqs\_kem} function, which simulates a Post-Quantum secure key exchange and derives session keys. This process replaces the previous custom interaction logic. The simulated steps are:
 	\begin{enumerate}
-		\item Exchanging aspects derived from their internal structure and phase.
-		\item Deterministically combining self-aspects with received aspects, simulating field overlay and feedback convergence.
-		\item Deriving the identical $\SQScomp$ (shared secret byte sequence) and $\SQSphase$ (shared phase lock value).
-		\item Performing validation checks (simulating $C_1$ phase coherence and $C_3$ pattern resonance/stability).
+		\item \textbf{KEM Key Generation:} The initiating Frame (A) generates an ML-KEM-1024 key pair ($pk_A, sk_A$) using \texttt{mlkem1024::keypair()}.
+		\item \textbf{KEM Encapsulation:} The responding Frame (B) conceptually receives $pk_A$ and uses it to encapsulate a shared secret via \texttt{mlkem1024::encapsulate(\&pk\_A)}, obtaining a shared secret ($ss_B$) and a ciphertext ($ct$).
+		\item \textbf{KEM Decapsulation:} Frame A conceptually receives $ct$ and uses its secret key $sk_A$ to decapsulate via \texttt{mlkem1024::decapsulate(\&ct, \&sk\_A)}, obtaining its view of the shared secret ($ss_A$).
+		\item \textbf{Verification:} The implementation verifies that $ss_A$ and $ss_B$ are identical. A mismatch indicates a critical error. The resulting verified shared secret is denoted $ss$.
+		\item \textbf{Salt Derivation:} A salt for HKDF is derived using SHA-512, hashing a domain separator, the sorted participant IDs (from \texttt{frame\_a} and \texttt{frame\_b}), and an application-provided context string.
+		\item \textbf{HKDF-Extract:} HKDF-Extract (using SHA-512) is applied to the KEM shared secret $ss$ (as IKM) and the derived salt, producing a Pseudorandom Key (PRK).
+		\item \textbf{HKDF-Expand (Components):} HKDF-Expand (using SHA-512) is applied to the PRK with the info string \texttt{"QFE\_SQS\_COMPONENTS\_V2"} to derive 64 bytes of general-purpose session key material ($\SQScomp$).
+		\item \textbf{HKDF-Expand (AEAD Key):} HKDF-Expand is applied again to the \emph{same} PRK but with the distinct info string \texttt{"QFE\_AEAD\_KEY\_V1"} to derive the specific 32-byte AEAD key ($k_{\text{AEAD}}$) for ChaCha20-Poly1305.
+		\item \textbf{SQS Creation:} An \texttt{Sqs} struct is created containing the derived $\SQScomp$, $k_{\text{AEAD}}$, participant IDs, and validation status.
+		\item \textbf{SQS Storage:} An atomically reference-counted pointer (\texttt{Arc<Sqs>}) to the created \texttt{Sqs} instance is stored within both \texttt{frame\_a} and \texttt{frame\_b}, establishing their shared context.
 	\end{enumerate}
-	Upon successful validation, both Frames store a reference to the \emph{same} $\SQS$ instance, establishing their entangled context.
+	After successful execution, it is recommended (though simulated here) that participants compare SQS fingerprints out-of-band to mitigate potential Man-in-the-Middle attacks during the conceptual exchange of $pk_A$ and $ct$.
 	
-	\subsection{Information Encoding}
-	Frame A encodes a message (sequence of bytes) using its $\SQS$:
+	\subsection{Authenticated Encryption (AEAD Encode)}
+	To send a message confidentially and with integrity, the sending Frame (A) uses the \texttt{encode\_aead(plaintext, associated\_data)} method:
 	\begin{enumerate}
-		\item Initialize a `current\_phase` variable to $\SQSphase$.
-		\item For each `byte` in the message:
-		\begin{enumerate}
-			\item Calculate a phase shift $\Delta\theta$ based on the `byte` value (e.g., mapping $[0, 255]$ to $[0, \Delta\theta_{\max}]$).
-			\item Calculate the next phase state: $\theta_{\text{next}} = (\text{current\_phase} + \Delta\theta) \pmod{2\piConst}$.
-			\item Calculate an integrity hash: $\IntegHash = \text{Hash}(\text{byte}, \SQScomp)$.
-			\item Store the pair $(\theta_{\text{next}}, \IntegHash)$ as an `EncodedUnit`.
-			\item Update `current\_phase = $\theta\_{\text{next}}$.
-		\end{enumerate}
-		\item The sequence of `EncodedUnit`s is the result.
+		\item Retrieve the shared \texttt{Sqs} context, specifically the AEAD key $k_{\text{AEAD}}$. Fail if no SQS is established or the Frame is invalid.
+		\item Generate a unique 12-byte random nonce $N$ using a cryptographically secure random number generator. Nonce uniqueness per key is mandatory.
+		\item Instantiate the ChaCha20-Poly1305 AEAD cipher using $k_{\text{AEAD}}$.
+		\item Encrypt the \texttt{plaintext} using the cipher, nonce $N$, and optional \texttt{associated\_data} (AD). This operation produces the ciphertext $C$ and a 16-byte authentication tag $T$.
+		\item Package the nonce $N$ and the combined ciphertext and tag $C||T$ into a \texttt{QfeEncryptedMessage} structure.
+		\item Return the \texttt{QfeEncryptedMessage}.
 	\end{enumerate}
-	Conceptually:
-	\begin{equation}
-		(\theta_{n}, H_n) = \text{Encode}(byte_n, \theta_{n-1}, \SQS)
-	\end{equation}
 	
 	\subsection{Transmission}
-	The sequence of `EncodedUnit` structures generated by Frame A is transmitted to Frame B. This sequence represents the propagation of modulated state influence across the reality interface defined by their shared context.
+	The sender (A) transmits the \texttt{QfeEncryptedMessage} (containing the nonce and the ciphertext+tag) to the receiver (B) over the communication channel.
 	
-	\subsection{Decoding}
-	Frame B decodes the received sequence of `EncodedUnit`s using its identical $\SQS$:
+	\subsection{Authenticated Decryption (AEAD Decode)}
+	Upon receiving a \texttt{QfeEncryptedMessage}, the receiving Frame (B) uses the \texttt{decode\_aead(\&encrypted\_message, associated\_data)} method:
 	\begin{enumerate}
-		\item Initialize a `previous\_phase` variable to $\SQSphase$.
-		\item For each received `EncodedUnit` containing $(\theta_{\text{received}}, H_{\text{received}})$:
-		\begin{enumerate}
-			\item Calculate the phase shift: $\Delta\theta = (\theta_{\text{received}} - \text{previous\_phase}) \pmod{2\piConst}$.
-			\item Reconstruct the original byte (`byte'`) from $\Delta\theta$ using the inverse mapping. Check if $\Delta\theta$ is within the valid range; if not, fail (decoherence detected).
-			\item Recalculate the integrity hash using the reconstructed byte and the receiver's $\SQScomp$: $H_{\text{expected}} = \text{Hash}(\text{byte'}, \SQScomp)$.
-			\item Compare hashes: If $H_{\text{expected}} \neq H_{\text{received}}$, fail (tampering or wrong SQS detected).
-			\item If checks pass, append `byte'` to the decoded message.
-			\item Update `previous\_phase = $\theta\_{\text{received}}$.
-		\end{enumerate}
-		\item The resulting sequence of bytes is the decoded message.
+		\item Retrieve the shared \texttt{Sqs} context and the AEAD key $k_{\text{AEAD}}$. Fail if no SQS is established or the Frame is invalid.
+		\item Extract the nonce $N$ and the combined ciphertext+tag $C||T$ from the received \texttt{encrypted\_message}. Verify nonce length (12 bytes).
+		\item Separate the combined $C||T$ into the ciphertext $C$ and the 16-byte tag $T$. Fail if the combined length is less than 16 bytes.
+		\item Instantiate the ChaCha20-Poly1305 AEAD cipher using $k_{\text{AEAD}}$.
+		\item Attempt to decrypt and verify the ciphertext $C$ using the cipher, nonce $N$, the same optional \texttt{associated\_data} (AD) used during encryption, and the tag $T$.
+		\item If the tag $T$ is valid for the key, nonce, ciphertext, and AD, the decryption succeeds and the original \texttt{plaintext} is returned.
+		\item If the tag verification fails (indicating tampering, wrong key, wrong nonce, or wrong AD), the decryption fails, an error (\texttt{QfeError::DecodingFailed}) is returned, and the receiving Frame's validation status is set to false.
 	\end{enumerate}
-	Conceptually:
-	\begin{equation}
-		byte'_n = \text{Decode}((\theta_{n}, H_n), \theta_{n-1}, \SQS) \quad \text{iff coherence checks pass}
-	\end{equation}
 	
+	% Replace Section 4 "Security Analysis"
 	\section{Security Analysis}
 	
-	The security of QFE relies on the principles of coherence and structural integrity:
+	The security guarantees of the revised Qualitative Frame Entanglement (QFE) framework are now predicated on the well-established security properties of the standard cryptographic primitives employed, rather than the conceptual principles of the original QFE proposal. The analysis assumes correct implementation and proper usage (e.g., nonce management) of these primitives.
+	
+	\subsection{Key Establishment (ML-KEM-1024)}
+	The establishment of the initial shared secret ($ss$) relies on the ML-KEM-1024 (Kyber) algorithm.
 	\begin{itemize}
-		\item \textbf{Eavesdropping requires SQS:} An external party cannot decode the message without possessing the identical $\SQS$, as they cannot verify the `integrity\_hash` or correctly interpret the phase shifts relative to the correct $\SQSphase$. Attempting to decode with the wrong SQS context leads to detected incoherence (either phase errors or integrity mismatch).
-		\item \textbf{Tampering Detection:} Any modification to an `EncodedUnit` in transit (either its `modulated\_phase` or `integrity\_hash`) will, with very high probability, cause a mismatch during the receiver's integrity verification or phase shift validation, leading to decoding failure and detection of the tampering. This simulates the principle that incoherent interaction (tampering) disrupts the state.
-		\item \textbf{Analogy to Quantum Principles:} The behavior where observation/interaction disturbs the state (requiring the SQS for coherent interaction) is analogous to measurement disturbance in quantum mechanics, suggesting a potential foundation for quantum-resistant communication.
+		\item \textbf{Security Goal:} To establish a shared secret between two parties (Alice and Bob) such that an eavesdropper observing the exchanged messages (Alice's public key $pk_A$, Bob's ciphertext $ct$) cannot compute the secret $ss$. This security should hold even against adversaries equipped with quantum computers.
+		\item \textbf{Security Property:} ML-KEM is designed to achieve IND-CCA2 (Indistinguishability under Adaptive Chosen Ciphertext Attack) security. This is the standard security definition for Key Encapsulation Mechanisms.
+		\item \textbf{Underlying Assumption:} The security of ML-KEM relies on the computational hardness of the Module Learning With Errors (Module-LWE) problem over specific algebraic structures. Module-LWE is widely believed to be resistant to efficient attacks by both classical and known quantum algorithms (including Shor's algorithm).
+		\item \textbf{Result:} Assuming the hardness of Module-LWE, the shared secret $ss$ established via the ML-KEM exchange is computationally secure against passive and active attackers (in the IND-CCA2 model) on the key exchange messages, including quantum attackers.
 	\end{itemize}
 	
+	\subsection{Key Derivation (HKDF-SHA512)}
+	The shared secret $ss$ from ML-KEM is used as Input Keying Material (IKM) for HKDF-SHA512 to derive session-specific keys (\texttt{Sqs.components} and \texttt{Sqs.aead\_key}).
+	\begin{itemize}
+		\item \textbf{Security Goal:} To derive multiple strong cryptographic keys from a single initial shared secret, such that the derived keys are computationally indistinguishable from random strings and independent of each other.
+		\item \textbf{Security Property:} HKDF (RFC 5869) is designed as a secure Key Derivation Function (KDF). When instantiated with a secure hash function like SHA-512, it acts as a Pseudo-Random Function (PRF). The Extract step concentrates potentially non-uniform entropy from the IKM into a fixed-size Pseudorandom Key (PRK), while the Expand step generates the required output keying material.
+		\item \textbf{Underlying Assumption:} Relies on the security of the underlying hash function (SHA-512) and the PRF-security of the HMAC construction used internally by HKDF.
+		\item \textbf{Result:} The derived keys (\texttt{Sqs.components}, \texttt{Sqs.aead\_key}) are cryptographically strong and suitable for their intended purposes (general session context, AEAD key). The use of distinct context-specific "info" strings during HKDF-Expand ensures cryptographic separation between the derived keys. An attacker without knowledge of the initial secret $ss$ cannot compute these keys.
+	\end{itemize}
+	
+	\subsection{Communication Security (ChaCha20-Poly1305 AEAD)}
+	Messages are protected using the ChaCha20-Poly1305 AEAD cipher, keyed by \texttt{Sqs.aead\_key}.
+	\begin{itemize}
+		\item \textbf{Security Goal:} To provide confidentiality (preventing eavesdroppers from reading message content), integrity (preventing undetected modification of messages), and authenticity (ensuring messages originate from the key holder).
+		\item \textbf{Security Property:} ChaCha20-Poly1305 provides AEAD security, satisfying standard notions like IND-CPA (or stronger) for confidentiality and INT-CTXT for integrity/authenticity.
+		\item \textbf{Underlying Assumption:} Relies on the assumed security of the ChaCha20 stream cipher as a pseudorandom function and the Poly1305 authenticator as a secure message authentication code (MAC). A critical operational assumption is the **uniqueness of the nonce** used for each encryption operation performed with the same key. Nonce reuse catastrophically breaks both confidentiality and authenticity. The implementation uses randomly generated 12-byte nonces, which provides high probability of uniqueness.
+		\item \textbf{Result:} Messages encrypted with \texttt{encode\_aead} are protected against eavesdropping and tampering. Successful decryption with \texttt{decode\_aead} assures the receiver of the message's confidentiality, integrity, and origin from the party holding the corresponding session key, provided nonces are managed correctly.
+	\end{itemize}
+	
+	\subsection{Limitations and Further Considerations}
+	\begin{itemize}
+		\item \textbf{Man-in-the-Middle (MitM) during Key Establishment:} The base ML-KEM protocol, like Diffie-Hellman, does not inherently protect against an active MitM attacker during the exchange of the public key ($pk_A$) and ciphertext ($ct$). An attacker could potentially intercept and replace these messages. Preventing this requires either performing the exchange over a pre-authenticated channel or verifying the established session context out-of-band (e.g., using the SQS fingerprint derived from the final \texttt{Sqs.components}).
+		\item \textbf{Forward Secrecy:} Since \texttt{establish\_sqs\_kem} generates fresh ML-KEM key pairs for each call via \texttt{mlkem1024::keypair()}, the resulting session keys (\texttt{Sqs.components}, \texttt{Sqs.aead\_key}) benefit from forward secrecy. Compromise of long-term identity keys (if any existed) would not compromise past session keys established this way.
+		\item \textbf{Implementation Security:} This analysis assumes the underlying cryptographic libraries (\texttt{pqcrypto}, \texttt{hkdf}, \texttt{chacha20poly1305}, \texttt{sha2}) are correctly implemented and that the QFE integration uses them properly (e.g., nonce uniqueness, correct handling of inputs/outputs). Implementation vulnerabilities (side channels, buffer overflows, etc.) are outside this scope.
+	\end{itemize}
+	
+	In conclusion, the security of the revised QFE framework now rests on the well-understood foundations of standard, modern cryptography, including post-quantum key establishment via ML-KEM and authenticated encryption via ChaCha20-Poly1305. The previous security arguments based on phase modulation and coherence are no longer applicable.
+	
+	% Replace Section 5 "Conclusion"
 	\section{Conclusion}
 	
-	Qualitative Frame Entanglement (QFE) presents a novel approach to secure communication, derived entirely from the nature of reality itself. By leveraging concepts of shared structural entanglement (SQS), qualitative state modulation (phase encoding), and mandatory coherence for interaction, QFE aims to provide security based on the fundamental structure of the framework's reality, rather than computational complexity assumptions. The integrity checks tied to the shared SQS components provide a direct mechanism for tamper detection, reflecting the principle that incoherent interactions necessarily disturb coherent systems. The implemented Rust simulation provides a concrete example of these principles in action. Further exploration could involve investigating the deeper implications of QFE's novel approach for information security.
+	The Qualitative Frame Entanglement (QFE) framework, as described in this document reflecting its implementation as of \today~(April 7, 2025), provides an experimental platform in Rust for simulating secure communication protocols. It demonstrates the successful integration of standard, high-assurance cryptographic components to achieve robust security guarantees suitable for modern applications, including consideration for post-quantum threats.
 	
-	\begin{thebibliography}{1}
-		\bibitem{gemini}
-		Gemini, response to "Derive a quantum proof algorithm" Google, March 30, 2025, https://gemini.google.com/ 	
+	Secure sessions within QFE are now established using the NIST standard post-quantum Key Encapsulation Mechanism ML-KEM-1024 (Kyber), ensuring that the foundational shared secrets resist attacks even from adversaries possessing quantum computers. These secrets are processed using the standard HKDF-SHA512 Key Derivation Function to generate specific, context-bound keys for communication. Subsequent message exchange is protected by the ChaCha20-Poly1305 Authenticated Encryption with Associated Data (AEAD) scheme, providing strong guarantees of confidentiality, data integrity, and message authenticity. The framework also incorporates experimental Zero-Knowledge Proof capabilities, demonstrating the potential for advanced cryptographic features within the QFE structure.
+	
+	This architecture represents a significant evolution from the initial QFE concepts that sought to derive security properties from foundational or philosophical principles related to coherence and phase modulation. While the 'Frame' abstraction is retained for managing participant state and identity (using cryptographic hashing during initialization), the security of the communication protocol now firmly relies on the well-understood computational hardness assumptions associated with the underlying standard cryptographic primitives: ML-KEM, HKDF, SHA-512, and ChaCha20-Poly1305.
+	
+	Consequently, the revised QFE provides post-quantum secure key establishment and strong authenticated encryption, aligning with current cryptographic best practices. Future work could involve exploring alternative PQC KEMs or AEAD schemes, further developing the ZKP features, formally analyzing the security of the integrated protocol flow, and designing robust mechanisms for the authenticated exchange of initial KEM messages to prevent Man-in-the-Middle attacks.
+	
+	In its current state, QFE serves as a valuable experimental framework demonstrating the practical integration of post-quantum key establishment with modern authenticated encryption within a simulated, stateful communication context.
+	
+	\begin{thebibliography}{9} % Adjust the number '9' if you have more/fewer references
+		
+		\bibitem{NIST_FIPS_203}
+		National Institute of Standards and Technology (NIST).
+		\textit{FIPS PUB 203: Module-Lattice-Based Key-Encapsulation Mechanism Standard}.
+		August 2023.
+		Available: \url{https://csrc.nist.gov/pubs/fips/203/final}
+		% Reference for ML-KEM (CRYSTALS-Kyber)
+		
+		\bibitem{NIST_FIPS_180_4}
+		National Institute of Standards and Technology (NIST).
+		\textit{FIPS PUB 180-4: Secure Hash Standard (SHS)}.
+		August 2015.
+		Available: \url{https://csrc.nist.gov/pubs/fips/180-4/final}
+		% Reference for SHA-2 family, including SHA-512
+		
+		\bibitem{RFC_5869}
+		Krawczyk, H. and Eronen, P.
+		\textit{RFC 5869: HMAC-based Extract-and-Expand Key Derivation Function (HKDF)}.
+		IETF, May 2010.
+		Available: \url{https://www.rfc-editor.org/info/rfc5869}
+		% Reference for HKDF
+		
+		\bibitem{RFC_8439}
+		Nir, Y. and Langley, A.
+		\textit{RFC 8439: ChaCha20 and Poly1305 for IETF Protocols}.
+		IETF, June 2018.
+		Available: \url{https://www.rfc-editor.org/info/rfc8439}
+		% Reference for ChaCha20 stream cipher, Poly1305 authenticator, and the combined AEAD scheme
+		
+		\bibitem{Ristretto_Draft}
+		Hamburg, M., et al. % Include other authors if known/desired, check draft for full list
+		\textit{draft-irtf-cfrg-ristretto255-04: The Ristretto Prime-Order Group}.
+		Internet Research Task Force (IRTF) Crypto Forum Research Group (CFRG), Work in Progress, October 2023. % Check for latest draft version/date
+		Available: \url{https://datatracker.ietf.org/doc/draft-irtf-cfrg-ristretto255/}
+		% Reference for the Ristretto group construction used with Curve25519
+		
+		\bibitem{Schnorr_91}
+		Schnorr, C. P.
+		\textit{Efficient signature generation by smart cards}.
+		Journal of Cryptology, 4(3):161–174, 1991.
+		% Reference for the original Schnorr identification scheme / signature concept
+		
+		\bibitem{NIST_FIPS_198_1}
+		National Institute of Standards and Technology (NIST).
+		\textit{FIPS PUB 198-1: The Keyed-Hash Message Authentication Code (HMAC)}.
+		July 2008.
+		Available: \url{https://csrc.nist.gov/pubs/fips/198-1/final}
+		% Optional: Reference for HMAC (used internally by HKDF)
+		
 	\end{thebibliography}
 	
 	

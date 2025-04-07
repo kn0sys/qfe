@@ -13,8 +13,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // --- Setup ---
     println!("\n[1] Setup Phase:");
-    let mut prover = Frame::initialize("NI_Prover".to_string(), 202504061); // Updated ID
-    let mut verifier = Frame::initialize("NI_Verifier".to_string(), 202504062); // Updated ID
+    let mut prover = Frame::initialize("NI_Prover".to_string()); // Updated ID
+    let mut verifier = Frame::initialize("NI_Verifier".to_string()); // Updated ID
     println!("    Prover and Verifier Frames initialized.");
 
     // Define Witness & Public Statement H(W)
@@ -70,7 +70,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // --- Test Invalid Witness Scenario (Non-Interactive) ---
     println!("\n[4] Testing Invalid Witness Scenario (Non-Interactive):");
-    let mut bad_prover = Frame::initialize("BadProverNI".to_string(), 999991); // Updated ID
+    let mut bad_prover = Frame::initialize("BadProverNI".to_string()); // Updated ID
     let wrong_witness = b"i_still_do_not_know_the_secret".to_vec(); // Updated wrong witness
     bad_prover.store_zkp_witness(&wrong_witness)?;
     println!("    BadProver stored incorrect witness.");
