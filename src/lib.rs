@@ -2,15 +2,45 @@
 //! based on shared state establishment and modulated signals.
 
 use std::sync::Arc; // For shared ownership of Sqs
-use std::hash::{Hash, Hasher};
-use std::collections::hash_map::DefaultHasher; // Simple standard hasher
+use std::hash::Hash;
 use std::error::Error;
 use std::fmt;
 use sha2::{Sha512, Digest};
 
 pub mod zkp;
-pub use zkp::{ ZkpChallenge, ZkpValidityResponse, establish_zkp_sqs, generate_zkp_challenge };
+pub use zkp::{ZkpValidityResponse, establish_zkp_sqs};
 pub type Sha512Hash = [u8; 64];
+
+use chacha20poly1305::{
+    aead::{Aead, AeadInPlace, KeyInit, Nonce}, // Import necessary traits and types
+    ChaCha20Poly1305, // The AEAD cipher implementation
+    Key, // Type alias for the 32-byte key
+};
+
+use rand::RngCore;
+
+/// Structure to hold the result of AEAD encryption.
+#[derive(Debug, Clone)] // PartialEq, Eq, Hash might be tricky with Vec<u8>
+pub struct QfeEncryptedMessage {
+    /// Nonce used for encryption (12 bytes for ChaCha20Poly1305).
+    /// Must be unique per message per key. MUST be sent with ciphertext.
+    pub nonce: Vec<u8>, // Store as Vec<u8> for flexibility, convert to Nonce type on use
+    /// Ciphertext including the 16-byte authentication tag appended at the end.
+    pub ciphertext: Vec<u8>,
+}
+
+/// Helper function to derive the 32-byte AEAD key from SQS components.
+/// Uses the first 32 bytes of the 64-byte SHA-512 hash in Sqs.components.
+/// Returns an error if Sqs.components is not long enough.
+fn derive_aead_key(sqs_components: &[u8]) -> Result<Key, QfeError> {
+    if sqs_components.len() < 32 {
+        return Err(QfeError::InternalError(
+            "SQS components too short to derive AEAD key".to_string()
+        ));
+    }
+    // Directly use the first 32 bytes as the key
+    Ok(*Key::from_slice(&sqs_components[0..32]))
+}
 
 // // --- Constants derived from Framework Core Mathematics ---
 // Primary Scale: φ (phi)
@@ -20,16 +50,14 @@ const RESONANCE_FREQ: f64 = PHI / (2.0 * std::f64::consts::PI);
 
 // --- Core Data Structures ---
 
-/// Represents one unit of encoded information.
-#[derive(Debug, Clone, PartialEq)] // Added Eq for array comparison
-pub struct EncodedUnit {
-    /// The phase state ([0, 2PI)) after encoding this unit.
-    // Note: f64 doesn't implement Eq, so PartialEq remains. If EncodedUnit needs Eq, phase might need adjusted representation.
-    // For now, PartialEq is sufficient as we compare hashes as arrays.
-    pub modulated_phase: f64,
-    /// Integrity value (SHA-512 hash) calculated using the original byte and Sqs components.
-    // CHANGED: Type from u64 to [u8; 64] for SHA-512 output
-    pub integrity_hash: [u8; 64],
+/// Represents a signature/MAC for a message, generated using an SQS context.
+///
+/// This provides message integrity and authenticity based on the shared secret
+/// within the SQS.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct QfeSignature {
+    /// The signature value (SHA-512 hash output).
+    pub value: Sha512Hash, // [u8; 64]
 }
 
 /// Custom error types for the QFE library operations.
@@ -41,6 +69,7 @@ pub enum QfeError {
     InvalidUtf8(std::string::FromUtf8Error),
     FrameInvalid,
     SqsMissing,
+    InvalidSignature,
     InternalError(String),
 }
 
@@ -54,6 +83,7 @@ impl fmt::Display for QfeError {
             QfeError::InvalidUtf8(e) => write!(f, "Decoded data is not valid UTF-8: {}", e),
             QfeError::FrameInvalid => write!(f, "Operation failed: Frame is in an invalid state"),
             QfeError::SqsMissing => write!(f, "Operation failed: SQS component is missing"),
+            QfeError::InvalidSignature => write!(f, "Message signature verification failed"),
             QfeError::InternalError(s) => write!(f, "Internal QFE error: {}", s),
         }
     }
@@ -83,14 +113,13 @@ pub struct Sqs {
 // Debug impl for Sqs remains the same (still uses DefaultHasher for display hash)
 impl fmt::Debug for Sqs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let components_prefix = self.components.get(..4) // Get first 4 bytes safely
+            .map(|slice| format!("{:02x}{:02x}{:02x}{:02x}", slice[0], slice[1], slice[2], slice[3]))
+            .unwrap_or_else(|| "[]".to_string()); // Handle empty or short components
         f.debug_struct("Sqs")
          .field("pattern_type", &self.pattern_type)
          .field("components_len", &self.components.len())
-         .field("components_hash", &{
-             let mut hasher = DefaultHasher::new(); // Use DefaultHasher just for debug display
-             self.components.hash(&mut hasher);
-             format!("{:x}", hasher.finish())
-         })
+         .field("components_prefix", &components_prefix)
          .field("shared_phase_lock", &self.shared_phase_lock)
          .field("resonance_freq", &self.resonance_freq)
          .field("validation", &self.validation)
@@ -107,8 +136,9 @@ pub struct Frame {
     frame_structure: ReferenceFrame,
     phase: f64,
     sqs_component: Option<Arc<Sqs>>,
-    validation_status: bool,
+    pub validation_status: bool,
     pub zkp_witness: Option<Vec<u8>>,
+    pub zkp_secret_scalar: Option<curve25519_dalek::Scalar>,
 }
 
 // --- Framework Primitive Representations ---
@@ -140,14 +170,21 @@ struct ReferenceFrame {
 
 impl ReferenceFrame {
     /// Creates a new ReferenceFrame based on initial conditions (seed).
-    /// Simulates the unique structure arising from distinction.
+    /// Uses SHA-512 for derivation.
     fn new(seed: u64) -> Self {
-        let mut hasher = DefaultHasher::new();
-        seed.hash(&mut hasher);
-        // Incorporate PHI to tie it subtly to the framework's core math
-        PHI.to_bits().hash(&mut hasher);
+        let structural_id_hash: [u8; 64] = {
+            let mut hasher = Sha512::new();
+            hasher.update(seed.to_le_bytes());
+            hasher.update(b"QFE_STRUCTURAL_ID_V1"); // Domain separation
+            hasher.update(PHI.to_le_bytes()); // Incorporate framework constant
+            hasher.finalize().into()
+        };
+        // Take the first 16 bytes for the u128 ID
+        let structural_id = u128::from_le_bytes(
+             structural_id_hash[0..16].try_into().expect("Slice length mismatch for structural ID")
+        );
         ReferenceFrame {
-            structural_id: hasher.finish() as u128,
+            structural_id,
         }
     }
 }
@@ -186,20 +223,34 @@ impl Frame {
     /// * A new `Frame` instance.
     pub fn initialize(id: String, initial_seed: u64) -> Self {
         // Create the foundational distinction node (unique per frame init)
-        let mut node_hasher = DefaultHasher::new();
-        initial_seed.hash(&mut node_hasher);
-        "node".hash(&mut node_hasher); // Add context
-        let node = DistinctionNode { id: node_hasher.finish() };
+        // Create the foundational distinction node using SHA-512
+        let node_id_hash: [u8; 64] = {
+            let mut node_hasher = Sha512::new();
+            node_hasher.update(initial_seed.to_le_bytes());
+            node_hasher.update(b"QFE_NODE_ID_V1"); // Use specific domain separation
+            node_hasher.finalize().into()
+        };
+        // Take the first 8 bytes for the u64 ID
+        let node_id = u64::from_le_bytes(
+             node_id_hash[0..8].try_into().expect("Slice length mismatch for node ID")
+        );
+        let node = DistinctionNode { id: node_id };
 
         // Derive the reference frame structure from the seed
         let frame_structure = ReferenceFrame::new(initial_seed);
 
-        // Derive initial phase (θ₀) based on seed and framework constants
-        let mut phase_hasher = DefaultHasher::new();
-        initial_seed.hash(&mut phase_hasher);
-        "phase".hash(&mut phase_hasher); // Add context
-        PHI.to_bits().hash(&mut phase_hasher);
-        let phase = (phase_hasher.finish() as f64 / u64::MAX as f64) * 2.0 * std::f64::consts::PI; // Normalize hash to [0, 2PI)
+        let initial_phase_hash: [u8; 64] = {
+            let mut phase_hasher = Sha512::new();
+            phase_hasher.update(initial_seed.to_le_bytes());
+            phase_hasher.update(b"QFE_INITIAL_PHASE_V1"); // Domain separation
+            phase_hasher.update(PHI.to_le_bytes()); // Include framework constant
+            phase_hasher.finalize().into()
+        };
+        // Take the first 8 bytes, convert to u64, normalize to [0, 2PI)
+        let phase_u64 = u64::from_le_bytes(
+             initial_phase_hash[0..8].try_into().expect("Slice length mismatch for phase")
+        );
+        let phase = (phase_u64 as f64 / u64::MAX as f64) * 2.0 * std::f64::consts::PI;
 
         Frame {
             id,
@@ -210,6 +261,7 @@ impl Frame {
             sqs_component: None,
             validation_status: true, // Starts valid
             zkp_witness: None,
+            zkp_secret_scalar: None,
         }
     }
 
@@ -239,11 +291,19 @@ impl Frame {
     /// state for interaction purposes. Based on its unique structure and phase.
     /// Simulates the frame emitting its influence/field aspect.
     fn calculate_interaction_aspect(&self) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        self.node.hash(&mut hasher);
-        self.frame_structure.hash(&mut hasher);
-        self.phase.to_bits().hash(&mut hasher); // Incorporate phase directly
-        hasher.finish()
+        let aspect_hash: [u8; 64] = {
+            let mut hasher = Sha512::new();
+            hasher.update(b"QFE_INTERACTION_ASPECT_V1"); // Domain separation
+            // Hash the frame's unique components
+            hasher.update(self.node.id.to_le_bytes());
+            hasher.update(self.frame_structure.structural_id.to_le_bytes());
+            hasher.update(self.phase.to_le_bytes()); // Incorporate phase directly
+            hasher.finalize().into()
+        };
+        // Take the first 8 bytes for the u64 aspect value
+        u64::from_le_bytes(
+            aspect_hash[0..8].try_into().expect("Slice length mismatch for aspect")
+        )
     }
 
     /// Gets the frame's unique ID.
@@ -251,171 +311,7 @@ impl Frame {
         &self.id
     }
 
-    /// Encodes a message (byte slice) into a sequence of `EncodedUnit`s using the frame's SQS.
-    ///
-    /// This method applies the core encoding logic, modulating phase sequentially based on input bytes
-    /// and calculating integrity hashes tied to the SQS components.
-    ///
-    /// # Arguments
-    /// * `message`: The byte slice `&[u8]` containing the data to encode.
-    ///
-    /// # Returns
-    /// * `Ok(Vec<EncodedUnit>)` containing the resulting encoded signal sequence.
-    /// * `Err(QfeError)` if:
-    ///     - The frame has no established SQS (`QfeError::SqsMissing`).
-    ///     - The frame is invalid (`QfeError::FrameInvalid`).
-    ///     - An internal error occurs (`QfeError::InternalError`).
-    pub fn encode(&self, message: &[u8]) -> Result<Vec<EncodedUnit>, QfeError> {
-        if !self.has_sqs() {
-            return Err(QfeError::SqsMissing);
-        }
-        // Safely get the Sqs Arc, knowing has_sqs passed.
-        if !self.validation_status {
-             return Err(QfeError::FrameInvalid); // Check frame validity
-         }
-        let sqs = self.sqs_component.as_ref()
-            .ok_or(QfeError::InternalError("SQS missing despite check.".to_string()))?; // Handle internal logic error
 
-
-        let mut encoded_signal = Vec::with_capacity(message.len());
-        // Encoding starts relative to the Sqs established phase lock.
-        let mut current_phase = sqs.shared_phase_lock;
-
-        for &byte in message {
-            // 1. Calculate phase shift for this byte
-            let phase_shift = calculate_phase_shift_from_byte(byte);
-
-            // 2. Determine the new phase state (sequential modulation)
-            //    Resulting phase after applying the shift.
-            let next_phase = (current_phase + phase_shift).rem_euclid(2.0 * std::f64::consts::PI);
-
-            // 3. Calculate integrity hash using the original byte and Sqs secret
-            let integrity_hash = calculate_integrity_hash_sha512(byte, &sqs.components);
-
-            // 4. Store the resulting state (new phase) and integrity hash
-            encoded_signal.push(EncodedUnit {
-                modulated_phase: next_phase,
-                integrity_hash,
-            });
-
-            // 5. Update the phase for the next byte's modulation
-            current_phase = next_phase;
-        }
-
-        Ok(encoded_signal)
-    }
-
-    /// Decodes a received signal (slice of `EncodedUnit`s) back into bytes using the frame's SQS.
-    ///
-    /// This method performs the core decoding logic, reconstructing bytes from phase shifts
-    /// and verifying the integrity hash of each unit against the frame's SQS components.
-    ///
-    /// If an integrity check fails or an invalid phase shift is detected (indicating tampering or error),
-    /// the decoding process stops, an error is returned, and the frame's `validation_status`
-    /// is set to `false`.
-    ///
-    /// # Arguments
-    /// * `encoded_signal`: The `&[EncodedUnit]` slice representing the received signal.
-    ///
-    /// # Returns
-    /// * `Ok(Vec<u8>)` containing the successfully decoded message bytes.
-    /// * `Err(QfeError)` if:
-    ///     - The frame has no established SQS (`QfeError::SqsMissing`).
-    ///     - The frame is already invalid (`QfeError::FrameInvalid`).
-    ///     - An integrity check fails or an invalid phase shift is detected during decoding (`QfeError::DecodingFailed`).
-    ///     - An internal error occurs (`QfeError::InternalError`).
-    pub fn decode(&mut self, encoded_signal: &[EncodedUnit]) -> Result<Vec<u8>, QfeError> {
-        if !self.has_sqs() {
-            return Err(QfeError::SqsMissing);
-        }
-        if !self.validation_status {
-            // Frame is already invalid, perhaps from previous failed decode
-            return Err(QfeError::FrameInvalid);
-        }
-         let sqs = self.sqs_component.as_ref()
-            .ok_or(QfeError::InternalError("SQS missing despite check.".to_string()))?;
-
-        let mut decoded_message = Vec::with_capacity(encoded_signal.len());
-        // Decoding starts relative to the Sqs established phase lock.
-        let mut previous_phase = sqs.shared_phase_lock;
-
-        for (index, unit) in encoded_signal.iter().enumerate() {
-            let current_modulated_phase = unit.modulated_phase;
-
-            // 1. Calculate the phase shift between the previous state and this unit's state.
-            //    `rem_euclid` ensures the result is always positive [0, 2PI).
-            let phase_shift = (current_modulated_phase - previous_phase)
-                                .rem_euclid(2.0 * std::f64::consts::PI);
-
-            // 2. Reconstruct the original byte from the calculated phase shift.
-            let Some(reconstructed_byte) = reconstruct_byte_from_phase_shift(phase_shift) else {
-                // If reconstruction fails, it implies an invalid phase shift value was received.
-                self.validation_status = false;
-                return Err(QfeError::DecodingFailed(format!(
-                    "At index {}: Invalid phase shift ({:.4}) detected. Possible tampering or transmission error.",
-                    index, phase_shift
-                )));
-            };
-
-            // 3. Verify Integrity (Crucial Security Step -  Step 6 simulated)
-            //    Recalculate the hash using the reconstructed byte and *this frame's* Sqs components.
-            let expected_hash = calculate_integrity_hash_sha512(reconstructed_byte, &sqs.components);
-
-            if expected_hash != unit.integrity_hash {
-                // Mismatch! This indicates tampering or decoding with the wrong Sqs.
-                 self.validation_status = false; // Mark frame as invalid due to incoherent input
-                return Err(QfeError::DecodingFailed(format!(
-                    "At index {}: Integrity check mismatch. Tampering suspected or wrong SQS used.",
-                    index
-                )));
-            }
-
-            // 4. If integrity check passes, add the byte to the result.
-            decoded_message.push(reconstructed_byte);
-
-            // 5. Update the phase state for the next unit's comparison.
-            previous_phase = current_modulated_phase;
-        }
-
-        Ok(decoded_message)
-    }
-    /// Encodes a string slice (`&str`) into a sequence of `EncodedUnit`s.
-    ///
-    /// This is a convenience method that converts the string to bytes and calls [`encode`].
-    ///
-    /// # Arguments
-    /// * `message`: The string slice `&str` to encode.
-    ///
-    /// # Returns
-    /// * `Ok(Vec<EncodedUnit>)` containing the encoded signal sequence.
-    /// * `Err(QfeError)` if encoding fails (see [`encode`] errors).
-    pub fn encode_str(&self, message: &str) -> Result<Vec<EncodedUnit>, QfeError> {
-        if !self.validation_status { return Err(QfeError::FrameInvalid); }
-        self.encode(message.as_bytes())
-    }
-
-    /// Decodes a received signal (slice of `EncodedUnit`s) directly into a `String`.
-    ///
-    /// This is a convenience method that calls [`decode`] and then attempts to convert
-    /// the resulting bytes into a UTF-8 `String`.
-    ///
-    /// Requires mutable access (`&mut self`) because the underlying [`decode`] might
-    /// invalidate the frame's state upon detecting errors.
-    ///
-    /// # Arguments
-    /// * `encoded_signal`: The `&[EncodedUnit]` slice representing the received signal.
-    ///
-    /// # Returns
-    /// * `Ok(String)` containing the successfully decoded and UTF-8 validated string.
-    /// * `Err(QfeError)` if:
-    ///     - Decoding fails (see [`decode`] errors).
-    ///     - The decoded bytes are not valid UTF-8 (`QfeError::InvalidUtf8`).
-    pub fn decode_to_str(&mut self, encoded_signal: &[EncodedUnit]) -> Result<String, QfeError> {
-         if !self.validation_status { return Err(QfeError::FrameInvalid); } // Check before decoding attempt
-        let decoded_bytes = self.decode(encoded_signal)?;
-        // Attempt UTF-8 conversion, mapping error type
-        String::from_utf8(decoded_bytes).map_err(QfeError::InvalidUtf8)
-    }
     /// Checks if the frame is currently considered valid.
     ///
     /// The validation status can become `false` if operations like `decode` detect
@@ -468,6 +364,228 @@ impl Frame {
         );
 
         Ok(fingerprint)
+    }
+
+    /// Encrypts a message using ChaCha20-Poly1305 AEAD with the frame's SQS context.
+    ///
+    /// Generates a unique random nonce for each encryption. The nonce is included
+    /// in the returned `QfeEncryptedMessage`.
+    ///
+    /// # Arguments
+    /// * `plaintext`: The message bytes to encrypt.
+    /// * `associated_data`: Optional data to authenticate but not encrypt.
+    ///
+    /// # Returns
+    /// * `Ok(QfeEncryptedMessage)` containing the nonce and ciphertext+tag.
+    /// * `Err(QfeError)` if SQS is missing, frame is invalid, or key derivation fails.
+    pub fn encode_aead(
+        &self,
+        plaintext: &[u8],
+        associated_data: Option<&[u8]>
+    ) -> Result<QfeEncryptedMessage, QfeError> {
+        if !self.is_valid() { return Err(QfeError::FrameInvalid); }
+        let sqs = self.get_sqs().ok_or(QfeError::SqsMissing)?;
+
+        // 1. Derive AEAD key from SQS
+        let key = derive_aead_key(&sqs.components)?;
+        let cipher = ChaCha20Poly1305::new(&key);
+
+        // 2. Generate a unique Nonce (12 bytes for ChaCha20Poly1305)
+        // Using OsRngNonce requires enabling the 'std' feature potentially, or using OsRng directly
+        let mut nonce_bytes = [0u8; 12];
+        rand::rng().fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::<ChaCha20Poly1305>::from_slice(&nonce_bytes); // Create Nonce type
+
+        // 3. Encrypt the data
+        let _ciphertext = cipher.encrypt(nonce, plaintext)
+            .map_err(|e| QfeError::EncodingFailed(format!("AEAD encryption error: {}", e)))?;
+
+        // Include associated data in the encryption process if provided
+        // Note: AEAD encrypt methods often take plaintext as AsRef<[u8]>, AD separately.
+        // Re-check chacha20poly1305 docs: `encrypt` doesn't directly take AD.
+        // We need `encrypt_in_place` or construct the call differently if AD is used.
+        // Let's use `encrypt_in_place_detached` for clarity with AD.
+
+        // --- Revised Encryption Logic with AD ---
+        let key = derive_aead_key(&sqs.components)?;
+        let cipher = ChaCha20Poly1305::new(&key);
+        let mut nonce_bytes = [0u8; 12];
+        rand::rng().fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::<ChaCha20Poly1305>::from_slice(&nonce_bytes);
+
+        // Use encrypt_in_place_detached requires a mutable buffer
+        let mut buffer = Vec::with_capacity(plaintext.len() + 16); // Space for plaintext + tag
+        buffer.extend_from_slice(plaintext);
+
+        let tag = cipher.encrypt_in_place_detached(
+                nonce,
+                associated_data.unwrap_or(&[]), // Pass AD here
+                &mut buffer
+            )
+            .map_err(|e| QfeError::EncodingFailed(format!("AEAD encryption error: {}", e)))?;
+
+        // Append the tag to the ciphertext in the buffer
+        buffer.extend_from_slice(tag.as_slice());
+
+        Ok(QfeEncryptedMessage {
+            nonce: nonce_bytes.to_vec(), // Store the raw nonce bytes
+            ciphertext: buffer, // Ciphertext now includes the tag
+        })
+    }
+
+    /// Decrypts a message using ChaCha20-Poly1305 AEAD with the frame's SQS context.
+    ///
+    /// Verifies the integrity and authenticity using the tag included in the ciphertext.
+    /// Marks the frame invalid if decryption fails.
+    ///
+    /// # Arguments
+    /// * `encrypted_message`: The `QfeEncryptedMessage` containing nonce and ciphertext+tag.
+    /// * `associated_data`: Optional associated data that must match the data used during encryption.
+    ///
+    /// # Returns
+    /// * `Ok(Vec<u8>)` containing the original plaintext if decryption and verification succeed.
+    /// * `Err(QfeError)` if SQS is missing, frame is invalid, key derivation fails, or
+    ///   decryption/authentication fails (`QfeError::DecodingFailed`).
+    pub fn decode_aead(
+        &mut self, // Changed to &mut self to allow setting validation_status on failure
+        encrypted_message: &QfeEncryptedMessage,
+        associated_data: Option<&[u8]>
+    ) -> Result<Vec<u8>, QfeError> {
+         if !self.is_valid() { return Err(QfeError::FrameInvalid); } // Check before attempt
+         let sqs = self.get_sqs().ok_or(QfeError::SqsMissing)?;
+
+         // 1. Derive AEAD key from SQS
+         let key = derive_aead_key(&sqs.components)?;
+         let cipher = ChaCha20Poly1305::new(&key);
+
+         // 2. Get Nonce from message
+         if encrypted_message.nonce.len() != 12 {
+             self.validation_status = false;
+             return Err(QfeError::DecodingFailed("Invalid nonce length received".to_string()));
+         }
+         let nonce = Nonce::<ChaCha20Poly1305>::from_slice(&encrypted_message.nonce);
+
+         // 3. Decrypt the data (includes authenticity check)
+         // Use decrypt_in_place_detached if using that for encryption
+         let mut buffer = encrypted_message.ciphertext.clone(); // Clone to decrypt in place
+
+         // Need to split buffer into ciphertext and tag
+         if buffer.len() < 16 { // Check if buffer is large enough for the tag
+              self.validation_status = false;
+              return Err(QfeError::DecodingFailed("Ciphertext too short to contain tag".to_string()));
+         }
+         let tag_offset = buffer.len() - 16;
+         let (ciphertext_slice_mut, tag_slice) = buffer.split_at_mut(tag_offset);
+         let tag = chacha20poly1305::Tag::from_slice(tag_slice);
+
+
+         let decrypt_result = cipher.decrypt_in_place_detached(
+             nonce,
+             associated_data.unwrap_or(&[]), // Pass AD here
+             ciphertext_slice_mut, // Provide mutable ciphertext slice
+             tag // Provide the tag separately
+         );
+
+         match decrypt_result {
+             Ok(()) => {
+                 // Decryption successful, buffer now contains plaintext
+                 // Truncate buffer to remove decrypted padding/tag space if necessary (inplace should handle this)
+                 Ok(ciphertext_slice_mut.to_vec()) // Return the plaintext part
+             }
+             Err(e) => {
+                 self.validation_status = false; // Mark frame invalid on decryption failure
+                 Err(QfeError::DecodingFailed(format!("AEAD decryption/authentication failed: {}", e)))
+             }
+         }
+    }
+    /// Signs a message using the Frame's established SQS context.
+    ///
+    /// Computes a SHA-512 based hash incorporating the SQS shared secret (`components`),
+    /// participant IDs (for context), and the message itself. This acts as a
+    /// Message Authentication Code (MAC).
+    ///
+    /// # Arguments
+    /// * `message`: The byte slice `&[u8]` representing the message to sign.
+    ///
+    /// # Returns
+    /// * `Ok(QfeSignature)` containing the calculated signature hash.
+    /// * `Err(QfeError)` if:
+    ///     - The frame has no established SQS (`QfeError::SqsMissing`).
+    ///     - The frame is invalid (`QfeError::FrameInvalid`).
+    ///     - An internal error occurs (`QfeError::InternalError`).
+    pub fn sign_message(&self, message: &[u8]) -> Result<QfeSignature, QfeError> {
+        if !self.is_valid() { return Err(QfeError::FrameInvalid); }
+        let sqs = self.get_sqs().ok_or(QfeError::SqsMissing)?; // Check SQS exists
+
+        // Use SHA-512 like HMAC: Hash(Key || Message) conceptually
+        // Key = SQS.components, Message = actual message + context
+        let mut hasher = Sha512::new();
+
+        // Use a domain separator for signing
+        hasher.update(b"QFE_SIGNATURE_V1");
+
+        // Include the shared secret components first (acts as the key)
+        hasher.update(&sqs.components);
+
+        // Include participant IDs (sorted) for context binding
+        let mut ids = [sqs.participant_a_id.as_str(), sqs.participant_b_id.as_str()];
+        ids.sort_unstable();
+        hasher.update(ids[0].as_bytes());
+        hasher.update(ids[1].as_bytes());
+
+        // Include the message content itself
+        hasher.update(message);
+
+        // Finalize the hash
+        let signature_value: Sha512Hash = hasher.finalize().into();
+
+        Ok(QfeSignature { value: signature_value })
+    }
+
+    /// Verifies a message signature using the Frame's established SQS context.
+    ///
+    /// Re-computes the expected signature hash using the received message and the
+    /// shared SQS secret (`components`), then compares it to the provided signature.
+    /// This verifies both message integrity and authenticity (that it was signed by
+    /// someone possessing the shared SQS components).
+    ///
+    /// # Arguments
+    /// * `message`: The byte slice `&[u8]` representing the message received.
+    /// * `signature`: A reference to the `QfeSignature` received alongside the message.
+    ///
+    /// # Returns
+    /// * `Ok(())` if the signature is valid for the given message and SQS context.
+    /// * `Err(QfeError)` if:
+    ///     - The signature is invalid (`QfeError::InvalidSignature`).
+    ///     - The frame has no established SQS (`QfeError::SqsMissing`).
+    ///     - The frame is invalid (`QfeError::FrameInvalid`).
+    ///     - An internal error occurs (`QfeError::InternalError`).
+    pub fn verify_signature(
+        &self,
+        message: &[u8],
+        signature: &QfeSignature,
+    ) -> Result<(), QfeError> {
+        if !self.is_valid() { return Err(QfeError::FrameInvalid); }
+        let sqs = self.get_sqs().ok_or(QfeError::SqsMissing)?;
+
+        // Re-compute the hash using the exact same process and inputs as sign_message
+        let mut hasher = Sha512::new();
+        hasher.update(b"QFE_SIGNATURE_V1"); // Same domain separator
+        hasher.update(&sqs.components);     // SQS secret components
+        let mut ids = [sqs.participant_a_id.as_str(), sqs.participant_b_id.as_str()];
+        ids.sort_unstable();                // Sorted participant IDs
+        hasher.update(ids[0].as_bytes());
+        hasher.update(ids[1].as_bytes());
+        hasher.update(message);             // The message being verified
+
+        let expected_signature_value: Sha512Hash = hasher.finalize().into();
+
+        // Compare the expected hash with the provided signature's value
+        if expected_signature_value == signature.value {
+            Ok(()) // Signatures match!
+        } else {
+            Err(QfeError::InvalidSignature) // Signatures do not match!
+        }
     }
 }
 
@@ -585,20 +703,6 @@ pub fn establish_sqs(frame_a: &mut Frame, frame_b: &mut Frame) -> Result<(), Qfe
     }
 }
 
-/// Calculates an integrity hash (SHA-512) for a byte using Sqs components.
-// CHANGED: New function using SHA-512
-fn calculate_integrity_hash_sha512(byte: u8, sqs_components: &[u8]) -> [u8; 64] {
-    // Instantiate SHA-512 hasher
-    let mut hasher = Sha512::new();
-    // Update hasher with byte, SQS components, and constants
-    hasher.update([byte]); // Feed the byte
-    hasher.update(sqs_components); // Feed the SQS shared secret
-    hasher.update(RESONANCE_FREQ.to_le_bytes()); // Feed constants consistently
-    hasher.update(PHI.to_le_bytes());
-    // Finalize and convert to fixed-size array
-    hasher.finalize().into()
-}
-
 // NEW: Helper function to derive SQS components using SHA-512
 // This replaces the DefaultHasher logic previously inline in establish_sqs
 fn derive_shared_components_sha512(aspect1: u64, phase1: f64, aspect2: u64, phase2: f64) -> Vec<u8> {
@@ -621,33 +725,6 @@ fn derive_shared_components_sha512(aspect1: u64, phase1: f64, aspect2: u64, phas
     hasher.finalize().to_vec()
 }
 
-// --- Phase Modulation Constants and Helpers ---
-// Define a maximum phase shift per byte to prevent excessive deviation.
-// This value could be related to framework constants, e.g., scaled by PHI.
-const MAX_PHASE_SHIFT_PER_BYTE: f64 = (2.0 * std::f64::consts::PI) / (PHI * PHI * 4.0); // Example: Smaller shift range
-
-/// Calculates the phase shift corresponding to an input byte.
-/// Maps byte value [0-255] to a phase shift [0, MAX_PHASE_SHIFT_PER_BYTE].
-fn calculate_phase_shift_from_byte(byte: u8) -> f64 {
-    (byte as f64 / 255.0) * MAX_PHASE_SHIFT_PER_BYTE
-}
-
-/// Reconstructs the original byte from a phase shift.
-/// This is the inverse of `calculate_phase_shift_from_byte`.
-/// Includes tolerance for floating point inaccuracies.
-fn reconstruct_byte_from_phase_shift(shift: f64) -> Option<u8> {
-    // Check if shift is within the expected range (with small tolerance)
-    // The shift calculated in decode is always positive due to rem_euclid.
-    let tolerance = 1e-9;
-    if !(0.0..=MAX_PHASE_SHIFT_PER_BYTE + tolerance).contains(&shift) {
-        // Shift is outside the valid range, indicating potential error or tampering
-        return None;
-    }
-    // Inverse mapping: byte = round((shift / MAX_SHIFT) * 255.0)
-    let byte_f = (shift / MAX_PHASE_SHIFT_PER_BYTE) * 255.0;
-    // Round to nearest integer and clamp to valid u8 range [0, 255]
-    Some(byte_f.round().clamp(0.0, 255.0) as u8)
-}
 //
 // --- Unit Tests ---
 #[cfg(test)]
@@ -740,7 +817,6 @@ mod tests {
         // Phases likely different too, but components are the primary secret
     }
 
-
     #[test]
     fn test_establish_sqs_fails_if_already_established() {
         let mut frame_a = Frame::initialize("A".to_string(), 1);
@@ -778,154 +854,6 @@ mod tests {
             // This might pass depending on the exact seeds and check logic.
              println!("Warning: Test designed to fail validation passed instead.");
         }
-    }
-
-    // Helper to setup two frames with established Sqs for tests
-    fn setup_frames_for_encoding() -> (Frame, Frame) {
-        let mut frame_a = Frame::initialize("A_encdec".to_string(), 987);
-        let mut frame_b = Frame::initialize("B_encdec".to_string(), 654);
-        establish_sqs(&mut frame_a, &mut frame_b).expect("Sqs setup failed for encoding test");
-        (frame_a, frame_b)
-    }
-
-    #[test]
-    fn test_encode_decode_basic_string() {
-        let (frame_a, mut frame_b) = setup_frames_for_encoding();
-        let message_str = "Hello, QFE World!";
-        let message_bytes = message_str.as_bytes();
-
-        // Encode by Frame A
-        let encoded = frame_a.encode(message_bytes).expect("Encoding failed");
-        assert_eq!(encoded.len(), message_bytes.len(), "Encoded length mismatch");
-        if let Some(unit) = encoded.first() {
-             assert_eq!(unit.integrity_hash.len(), 64, "Integrity hash should be 64 bytes");
-        }
-        // Decode by Frame B
-        let decoded_bytes = frame_b.decode(&encoded).expect("Decoding failed");
-        assert_eq!(decoded_bytes, message_bytes, "Decoded bytes mismatch");
-
-        // Optional: Convert back to string to verify
-        let decoded_str = String::from_utf8(decoded_bytes).expect("Invalid UTF-8");
-        assert_eq!(decoded_str, message_str, "Decoded string mismatch");
-    }
-
-    #[test]
-    fn test_encode_decode_all_byte_values() {
-        let (frame_a, mut frame_b) = setup_frames_for_encoding();
-        let all_bytes: Vec<u8> = (0..=255).collect();
-
-        let encoded = frame_a.encode(&all_bytes).expect("Encoding all bytes failed");
-        assert_eq!(encoded.len(), all_bytes.len());
-
-        let decoded = frame_b.decode(&encoded).expect("Decoding all bytes failed");
-        assert_eq!(decoded, all_bytes);
-    }
-
-    #[test]
-    fn test_encode_decode_empty_message() {
-        let (frame_a, mut frame_b) = setup_frames_for_encoding();
-        let empty_message: Vec<u8> = Vec::new();
-
-        let encoded = frame_a.encode(&empty_message).expect("Encoding empty failed");
-        assert!(encoded.is_empty());
-
-        let decoded = frame_b.decode(&encoded).expect("Decoding empty failed");
-        assert!(decoded.is_empty());
-        assert_eq!(decoded, empty_message);
-    }
-
-     #[test]
-    fn test_decode_fails_on_tampered_integrity_hash() {
-        let (frame_a, mut frame_b) = setup_frames_for_encoding();
-        let message = b"Secret Data";
-        let mut encoded = frame_a.encode(message).expect("Encoding failed");
-
-        // Tamper: Modify the hash of the first unit
-        if !encoded.is_empty() {
-            encoded[0].integrity_hash[0] ^= 0x01; // Corrupt hash
-        }
-
-        let result = frame_b.decode(&encoded);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        println!("Tampered Hash Decode Error: {}", err); // Debug print
-        if let QfeError::DecodingFailed(msg) = &err {
-            assert!(msg.contains("Integrity check mismatch"), "Expected integrity error msg, got: {}", msg);
-            assert!(msg.contains("index 0"), "Error should mention index 0");
-        } else {
-            panic!("Expected DecodingFailed error variant, got {:?}", err);
-        }
-        assert!(!frame_b.validation_status); // Ensure frame is marked invalid
-    }
-
-    #[test]
-    fn test_decode_fails_on_tampered_modulated_phase() {
-        let (frame_a, mut frame_b) = setup_frames_for_encoding();
-        let message = b"Top Secret";
-        let mut encoded = frame_a.encode(message).expect("Encoding failed");
-
-        // Tamper: Modify the phase of the second unit significantly
-        if encoded.len() > 1 {
-            encoded[1].modulated_phase = (encoded[1].modulated_phase + std::f64::consts::PI) // Add 180 degrees
-                                         .rem_euclid(2.0 * std::f64::consts::PI);
-        }
-
-        let result = frame_b.decode(&encoded);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        println!("Tampered Phase Decode Error: {}", err); // Debug print
-        // This could fail either the phase shift reconstruction or the subsequent integrity check
-        assert!(
-            matches!(&err, QfeError::DecodingFailed(s) if s.contains("Invalid phase shift") || s.contains("Integrity check mismatch")),
-            "Expected DecodingFailed (phase or integrity), got {:?}", err
-        );
-         assert!(!frame_b.validation_status); // Ensure frame is marked invalid
-    }
-
-     #[test]
-    fn test_decode_fails_with_wrong_sqs_context() {
-        // Frame A encodes with A-B Sqs
-        let (frame_a, _frame_b) = setup_frames_for_encoding();
-        let message = b"Intended for B";
-        let encoded = frame_a.encode(message).expect("Encoding failed");
-
-        // Frame C tries to decode using C-D Sqs
-        let mut frame_c = Frame::initialize("C_decode".to_string(), 1122);
-        let mut frame_d = Frame::initialize("D_decode".to_string(), 3344);
-        establish_sqs(&mut frame_c, &mut frame_d).expect("Sqs C-D setup failed");
-
-        let result = frame_c.decode(&encoded); // Use Frame C (with C-D Sqs)
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        println!("Wrong SQS Decode Error: {}", err);
-        // Should fail the integrity check because Sqs components differ
-        // UPDATED ASSERTION: Accept either failure mode for wrong Sqs context
-        assert!(
-            matches!(
-                &err, QfeError::DecodingFailed(s) if s.contains("Integrity check mismatch") ||
-                s.contains("Invalid phase shift")
-            ),
-            "Expected DecodingFailed (integrity or phase shift) for wrong SQS, got {:?}", err
-        );
-        assert!(!frame_c.validation_status); // Ensure frame C is marked invalid
-    }
-
-    #[test]
-    fn encode_fails_if_frame_has_no_sqs() {
-         let frame_no_sqs = Frame::initialize("NoSqs_Enc".to_string(), 1);
-         let message = b"test";
-         let result = frame_no_sqs.encode(message);
-         assert!(result.is_err());
-         assert_eq!(result.unwrap_err(), QfeError::SqsMissing);
-    }
-
-     #[test]
-    fn decode_fails_if_frame_has_no_sqs() {
-         let mut frame_no_sqs = Frame::initialize("NoSqs_Dec".to_string(), 1);
-         let encoded_signal = vec![EncodedUnit { modulated_phase: 1.0, integrity_hash: [0u8; 64] }];
-         let result = frame_no_sqs.decode(&encoded_signal);
-         assert!(result.is_err());
-         assert_eq!(result.unwrap_err(), QfeError::SqsMissing);
     }
 
     /// Tests the SQS fingerprint generation for OOB authentication.
@@ -978,5 +906,441 @@ mod tests {
         let fp_err_invalid = frame_a.calculate_sqs_fingerprint();
         assert!(fp_err_invalid.is_err());
         assert!(matches!(fp_err_invalid.unwrap_err(), QfeError::FrameInvalid));
+    }
+
+    // Helper to setup two frames with established & conceptually authenticated SQS
+    // Re-using helper from encoding tests is fine if it exists, otherwise define here.
+    fn setup_frames_for_signing(id_a: &str, id_b: &str) -> (Frame, Frame) {
+        // Derive seeds from IDs using SHA-512
+        let seed_a: u64 = {
+            let mut hasher = Sha512::new();
+            hasher.update(b"QFE_TEST_SEED_DERIVATION_V1"); // Domain separation
+            hasher.update(id_a.as_bytes());
+            let hash_output: [u8; 64] = hasher.finalize().into();
+            // Take first 8 bytes for u64 seed
+            u64::from_le_bytes(hash_output[0..8].try_into().expect("Slice failed for seed_a"))
+        };
+
+        let seed_b: u64 = {
+            let mut hasher = Sha512::new();
+            hasher.update(b"QFE_TEST_SEED_DERIVATION_V1"); // Same domain separation
+            hasher.update(id_b.as_bytes());
+            let hash_output: [u8; 64] = hasher.finalize().into();
+            // Take first 8 bytes for u64 seed
+            u64::from_le_bytes(hash_output[0..8].try_into().expect("Slice failed for seed_b"))
+        };
+
+        // Initialize frames using the derived seeds (this now uses the updated initialize function)
+        let mut frame_a = Frame::initialize(id_a.to_string(), seed_a);
+        let mut frame_b = Frame::initialize(id_b.to_string(), seed_b);
+
+        // Establish SQS (this uses the updated establish_sqs logic internally)
+        establish_sqs(&mut frame_a, &mut frame_b)
+            .expect("SQS setup failed during test helper execution");
+
+        (frame_a, frame_b)
+    }
+
+    #[test]
+    fn test_sign_verify_success() {
+        let (frame_a, frame_b) = setup_frames_for_signing("s_a", "v_b");
+        let message = b"This is a message to be signed.";
+
+        // Alice signs
+        let signature_res = frame_a.sign_message(message);
+        assert!(signature_res.is_ok());
+        let signature = signature_res.unwrap();
+        assert_eq!(signature.value.len(), 64); // SHA-512 output size
+
+        // Bob verifies
+        let verification_res = frame_b.verify_signature(message, &signature);
+        assert!(verification_res.is_ok(), "Verification failed unexpectedly: {:?}", verification_res.err());
+    }
+
+    #[test]
+    fn test_verify_fail_tampered_message() {
+        let (frame_a, frame_b) = setup_frames_for_signing("s_a", "v_b");
+        let message = b"Original message content.";
+        let tampered_message = b"Original message content!"; // Changed punctuation
+
+        // Alice signs original message
+        let signature = frame_a.sign_message(message).expect("Signing failed");
+
+        // Bob verifies signature against TAMPERED message
+        let verification_res = frame_b.verify_signature(tampered_message, &signature);
+        assert!(verification_res.is_err(), "Verification should fail for tampered message");
+        assert_eq!(verification_res.unwrap_err(), QfeError::InvalidSignature);
+    }
+
+    #[test]
+    fn test_verify_fail_tampered_signature() {
+        let (frame_a, frame_b) = setup_frames_for_signing("s_a", "v_b");
+        let message = b"A message requiring integrity.";
+
+        // Alice signs message
+        let mut signature = frame_a.sign_message(message).expect("Signing failed");
+
+        // Tamper with signature value
+        signature.value[10] ^= 0xAB; // Flip some bits
+
+        // Bob verifies tampered signature against original message
+        let verification_res = frame_b.verify_signature(message, &signature);
+        assert!(verification_res.is_err(), "Verification should fail for tampered signature");
+        assert_eq!(verification_res.unwrap_err(), QfeError::InvalidSignature);
+    }
+
+    #[test]
+    fn test_verify_fail_wrong_sqs() {
+        // Setup A-B with SQS1
+        let (frame_a, _frame_b) = setup_frames_for_signing("s_a", "v_b");
+        // Setup C-D with SQS2
+        let (frame_c, _frame_d) = setup_frames_for_signing("s_c", "v_d"); // Re-use helper for simplicity, gives different SQS
+
+        // Ensure SQS differ (extremely likely with different seeds/IDs, but check)
+        assert_ne!(frame_a.get_sqs().unwrap().components, frame_c.get_sqs().unwrap().components);
+
+        let message = b"Message signed by A";
+
+        // A signs with SQS1
+        let signature = frame_a.sign_message(message).expect("Signing by A failed");
+
+        // C tries to verify using SQS2
+        let verification_res = frame_c.verify_signature(message, &signature);
+        assert!(verification_res.is_err(), "Verification should fail when using wrong SQS");
+        assert_eq!(verification_res.unwrap_err(), QfeError::InvalidSignature);
+    }
+
+    #[test]
+    fn test_sign_verify_no_sqs() {
+        let frame_a_no_sqs = Frame::initialize("NoSQS_Sign".to_string(), 9001);
+        let frame_b_no_sqs = Frame::initialize("NoSQS_Verify".to_string(), 9002);
+        let message = b"Cannot sign or verify";
+        let dummy_sig = QfeSignature { value: [0u8; 64] };
+
+        // Try signing without SQS
+        let sign_res = frame_a_no_sqs.sign_message(message);
+        assert!(sign_res.is_err());
+        assert_eq!(sign_res.unwrap_err(), QfeError::SqsMissing);
+
+        // Try verifying without SQS
+        let verify_res = frame_b_no_sqs.verify_signature(message, &dummy_sig);
+        assert!(verify_res.is_err());
+        assert_eq!(verify_res.unwrap_err(), QfeError::SqsMissing);
+    }
+
+    #[test]
+    fn test_sign_verify_invalid_frame() {
+        let (mut frame_a, mut frame_b) = setup_frames_for_signing("s_a", "v_b");
+        let message = b"Testing invalid frame state";
+        let signature = frame_a.sign_message(message).expect("Initial signing failed");
+
+        // Invalidate frames
+        frame_a.validation_status = false;
+        frame_b.validation_status = false;
+
+        // Try signing with invalid frame
+        let sign_res = frame_a.sign_message(message);
+        assert!(sign_res.is_err());
+        assert_eq!(sign_res.unwrap_err(), QfeError::FrameInvalid);
+
+        // Try verifying with invalid frame
+        let verify_res = frame_b.verify_signature(message, &signature);
+        assert!(verify_res.is_err());
+        assert_eq!(verify_res.unwrap_err(), QfeError::FrameInvalid);
+    }
+
+    mod aead_tests {
+        use super::*; // Import from parent `tests` module (and thus lib root)
+
+        // Helper function specific to AEAD tests
+        fn setup_frames_for_aead() -> (Frame, Frame) {
+            // Use the existing updated helper or redefine if needed
+            setup_frames_for_signing("AEAD_A", "AEAD_B") // Re-use helper is fine
+        }
+
+        #[test]
+        fn test_aead_encode_decode_success_no_ad() {
+            let (frame_a, mut frame_b) = setup_frames_for_aead();
+            let plaintext = b"This message is secret and authentic (no AD).";
+            let associated_data = None; // No associated data
+
+            // Encode
+            let encrypted_msg_res = frame_a.encode_aead(plaintext, associated_data);
+            assert!(encrypted_msg_res.is_ok());
+            let encrypted_msg = encrypted_msg_res.unwrap();
+
+            // Nonce should be 12 bytes, Ciphertext > plaintext + 16 bytes (tag)
+            assert_eq!(encrypted_msg.nonce.len(), 12);
+            assert!(encrypted_msg.ciphertext.len() >= plaintext.len() + 16);
+
+            // Decode
+            let decoded_res = frame_b.decode_aead(&encrypted_msg, associated_data);
+            assert!(decoded_res.is_ok());
+            let decoded_plaintext = decoded_res.unwrap();
+
+            // Verify correctness
+            assert_eq!(decoded_plaintext, plaintext);
+            assert!(frame_b.is_valid()); // Frame B should remain valid
+        }
+
+        #[test]
+        fn test_aead_encode_decode_success_with_ad() {
+            let (frame_a, mut frame_b) = setup_frames_for_aead();
+            let plaintext = b"This message is secret and authentic (with AD).";
+            let associated_data = Some(b"Important Context" as &[u8]);
+
+            // Encode
+            let encrypted_msg = frame_a.encode_aead(plaintext, associated_data)
+                                   .expect("Encoding with AD failed");
+
+            // Decode
+            let decoded_plaintext = frame_b.decode_aead(&encrypted_msg, associated_data)
+                                        .expect("Decoding with AD failed");
+
+            // Verify correctness
+            assert_eq!(decoded_plaintext, plaintext);
+            assert!(frame_b.is_valid());
+        }
+
+        #[test]
+        fn test_aead_encode_decode_empty_message() {
+            let (frame_a, mut frame_b) = setup_frames_for_aead();
+            let plaintext = b""; // Empty plaintext
+            let associated_data = Some(b"Context for empty message" as &[u8]);
+
+            // Encode
+            let encrypted_msg = frame_a.encode_aead(plaintext, associated_data)
+                                   .expect("Encoding empty message failed");
+            assert!(encrypted_msg.ciphertext.len() == 16); // Empty plaintext -> only tag remains
+
+            // Decode
+            let decoded_plaintext = frame_b.decode_aead(&encrypted_msg, associated_data)
+                                        .expect("Decoding empty message failed");
+
+            // Verify correctness
+            assert_eq!(decoded_plaintext, plaintext);
+            assert!(decoded_plaintext.is_empty());
+            assert!(frame_b.is_valid());
+        }
+
+
+        #[test]
+        fn test_aead_decode_fails_tampered_ciphertext() {
+            let (frame_a, mut frame_b) = setup_frames_for_aead();
+            let plaintext = b"Do not tamper!";
+            let mut encrypted_msg = frame_a.encode_aead(plaintext, None).unwrap();
+
+            // Tamper ciphertext (avoiding the tag at the end)
+            if encrypted_msg.ciphertext.len() > 16 { // Ensure there's ciphertext before tag
+                encrypted_msg.ciphertext[0] ^= 0xAA;
+            } else if !encrypted_msg.ciphertext.is_empty() {
+                 encrypted_msg.ciphertext[0] ^= 0xAA; // Tamper tag if only tag exists
+            }
+
+
+            // Attempt Decode
+            let decoded_res = frame_b.decode_aead(&encrypted_msg, None);
+            assert!(decoded_res.is_err());
+            let err = decoded_res.unwrap_err();
+            assert!(matches!(err, QfeError::DecodingFailed(_)));
+            assert!(err.to_string().contains("AEAD decryption/authentication failed"));
+            assert!(!frame_b.is_valid()); // Frame should be invalidated
+        }
+
+        #[test]
+        fn test_aead_decode_fails_tampered_tag() {
+            let (frame_a, mut frame_b) = setup_frames_for_aead();
+            let plaintext = b"Do not tamper tag!";
+            let mut encrypted_msg = frame_a.encode_aead(plaintext, None).unwrap();
+
+            // Tamper tag (last 16 bytes)
+            let ct_len = encrypted_msg.ciphertext.len();
+            if ct_len >= 16 {
+                 encrypted_msg.ciphertext[ct_len - 1] ^= 0xAA; // Flip last byte of tag
+            }
+
+            // Attempt Decode
+            let decoded_res = frame_b.decode_aead(&encrypted_msg, None);
+            assert!(decoded_res.is_err());
+            assert!(matches!(decoded_res.unwrap_err(), QfeError::DecodingFailed(_)));
+            assert!(!frame_b.is_valid());
+        }
+
+
+        #[test]
+        fn test_aead_decode_fails_tampered_nonce() {
+            let (frame_a, mut frame_b) = setup_frames_for_aead();
+            let plaintext = b"Cannot reuse nonces";
+            let mut encrypted_msg = frame_a.encode_aead(plaintext, None).unwrap();
+
+            // Tamper nonce
+            if !encrypted_msg.nonce.is_empty() {
+                encrypted_msg.nonce[0] ^= 0xAA;
+            }
+
+            // Attempt Decode
+            let decoded_res = frame_b.decode_aead(&encrypted_msg, None);
+            // Decryption will proceed but likely produce garbage or fail tag check
+            assert!(decoded_res.is_err());
+            assert!(matches!(decoded_res.unwrap_err(), QfeError::DecodingFailed(_)));
+            assert!(!frame_b.is_valid());
+        }
+
+        // In mod aead_tests
+
+        // Test AD mismatch (string vs string)
+        #[test]
+        fn test_aead_decode_fails_wrong_ad_string_mismatch() {
+            let (frame_a, mut frame_b) = setup_frames_for_aead();
+            let plaintext = b"AD must match";
+            let associated_data = Some(b"Correct AD" as &[u8]);
+            let wrong_associated_data = Some(b"Wrong AD" as &[u8]);
+
+            let encrypted_msg = frame_a.encode_aead(plaintext, associated_data).unwrap();
+
+            // Attempt decode with WRONG AD string
+            let decoded_res = frame_b.decode_aead(&encrypted_msg, wrong_associated_data);
+            assert!(decoded_res.is_err());
+            let err = decoded_res.unwrap_err();
+            println!("Wrong AD (String Mismatch) Decode Error: {:?}", err); // Optional debug
+            assert!(matches!(err, QfeError::DecodingFailed(_)), "Expected DecodingFailed for AD string mismatch");
+            assert!(!frame_b.is_valid());
+        }
+
+        // Test AD mismatch (None vs Some)
+        #[test]
+        fn test_aead_decode_fails_wrong_ad_none_vs_some() {
+            let (frame_a, mut frame_b) = setup_frames_for_aead();
+            let plaintext = b"AD must match";
+            let associated_data = Some(b"Correct AD" as &[u8]);
+
+            let encrypted_msg = frame_a.encode_aead(plaintext, associated_data).unwrap();
+
+            // Attempt decode with NO AD (when encoded with AD)
+            let decoded_res_no_ad = frame_b.decode_aead(&encrypted_msg, None);
+            assert!(decoded_res_no_ad.is_err());
+            let err = decoded_res_no_ad.unwrap_err();
+            println!("Wrong AD (None vs Some) Decode Error: {:?}", err); // Optional debug
+            assert!(matches!(err, QfeError::DecodingFailed(_)), "Expected DecodingFailed for AD mismatch (None vs Some)");
+            assert!(!frame_b.is_valid());
+        }
+
+        // Test Nonce length too short
+        #[test]
+        fn test_aead_decode_fails_nonce_too_short() {
+            let (frame_a, mut frame_b) = setup_frames_for_aead();
+            let plaintext = b"Nonce length matters";
+            let encrypted_msg_ok = frame_a.encode_aead(plaintext, None).unwrap();
+
+            let mut bad_nonce_msg = encrypted_msg_ok.clone();
+            bad_nonce_msg.nonce = vec![0u8; 11]; // 11 bytes
+
+            let decoded_res = frame_b.decode_aead(&bad_nonce_msg, None);
+            assert!(decoded_res.is_err());
+            let err = decoded_res.unwrap_err();
+            println!("Wrong Nonce Length (11) Decode Error: {:?}", err); // Optional debug
+            assert!(matches!(err, QfeError::DecodingFailed(_)), "Expected DecodingFailed for Nonce Length 11");
+            // Check the specific error message associated with the nonce length check
+            assert!(err.to_string().contains("Invalid nonce length received"), "Incorrect error message for short nonce");
+            assert!(!frame_b.is_valid());
+        }
+
+        // Test Nonce length too long
+        #[test]
+        fn test_aead_decode_fails_nonce_too_long() {
+            let (frame_a, mut frame_b) = setup_frames_for_aead();
+            let plaintext = b"Nonce length matters";
+            let encrypted_msg_ok = frame_a.encode_aead(plaintext, None).unwrap();
+
+            let mut bad_nonce_msg = encrypted_msg_ok.clone();
+            bad_nonce_msg.nonce = vec![0u8; 13]; // 13 bytes
+
+            let decoded_res_13 = frame_b.decode_aead(&bad_nonce_msg, None);
+            assert!(decoded_res_13.is_err());
+            let err = decoded_res_13.unwrap_err();
+            println!("Wrong Nonce Length (13) Decode Error: {:?}", err); // Optional debug
+            assert!(matches!(err, QfeError::DecodingFailed(_)), "Expected DecodingFailed for Nonce Length 13");
+            assert!(err.to_string().contains("Invalid nonce length received"), "Incorrect error message for long nonce");
+            assert!(!frame_b.is_valid());
+        }
+
+        #[test]
+        fn test_aead_decode_fails_ad_mismatch_encode_none_decode_some() {
+            let (frame_a, mut frame_b) = setup_frames_for_aead();
+            let plaintext = b"AD mismatch 2";
+            let associated_data = Some(b"Some AD" as &[u8]);
+
+            // Encode with NO AD
+            let encrypted_msg = frame_a.encode_aead(plaintext, None).unwrap();
+
+             // Attempt decode with SOME AD (when encoded with None)
+             let decoded_res = frame_b.decode_aead(&encrypted_msg, associated_data);
+             assert!(decoded_res.is_err());
+             assert!(matches!(decoded_res.unwrap_err(), QfeError::DecodingFailed(_)));
+             assert!(!frame_b.is_valid());
+        }
+
+
+        #[test]
+        fn test_aead_decode_fails_wrong_sqs() {
+            // Setup A-B with SQS1
+            let (frame_a, _frame_b) = setup_frames_for_aead();
+            // Setup C-D with SQS2
+            let (mut frame_c, _frame_d) = setup_frames_for_signing("AEAD_C", "AEAD_D"); // Use different IDs
+
+            // Ensure SQS differ
+            assert_ne!(
+                frame_a.get_sqs().unwrap().components,
+                frame_c.get_sqs().unwrap().components
+            );
+
+            let plaintext = b"Message from A";
+            // A encodes with SQS1
+            let encrypted_msg = frame_a.encode_aead(plaintext, None).unwrap();
+
+            // C tries to decode with SQS2 (wrong key)
+            let decoded_res = frame_c.decode_aead(&encrypted_msg, None);
+            assert!(decoded_res.is_err());
+            assert!(matches!(decoded_res.unwrap_err(), QfeError::DecodingFailed(_)));
+            assert!(!frame_c.is_valid()); // Frame C should be invalidated
+        }
+
+        #[test]
+        fn test_aead_encode_decode_no_sqs() {
+            let frame_a_no_sqs = Frame::initialize("NoSQS_AEAD_A".to_string(), 1001);
+            let mut frame_b_no_sqs = Frame::initialize("NoSQS_AEAD_B".to_string(), 1002);
+            let plaintext = b"Cannot encrypt";
+            let dummy_encrypted = QfeEncryptedMessage { nonce: vec![0;12], ciphertext: vec![0;32]};
+
+            let enc_res = frame_a_no_sqs.encode_aead(plaintext, None);
+            assert!(enc_res.is_err());
+            assert!(matches!(enc_res.unwrap_err(), QfeError::SqsMissing));
+
+            let dec_res = frame_b_no_sqs.decode_aead(&dummy_encrypted, None);
+            assert!(dec_res.is_err());
+            assert!(matches!(dec_res.unwrap_err(), QfeError::SqsMissing));
+        }
+
+        #[test]
+        fn test_aead_encode_decode_invalid_frame() {
+            let (mut frame_a, mut frame_b) = setup_frames_for_aead();
+            let plaintext = b"Invalid frame test";
+            let encrypted_msg = frame_a.encode_aead(plaintext, None).unwrap(); // Encode while valid
+
+            // Invalidate frames
+            frame_a.validation_status = false;
+            frame_b.validation_status = false;
+
+            // Try encoding with invalid frame
+            let enc_res = frame_a.encode_aead(plaintext, None);
+            assert!(enc_res.is_err());
+            assert!(matches!(enc_res.unwrap_err(), QfeError::FrameInvalid));
+
+             // Try decoding with invalid frame
+             let dec_res = frame_b.decode_aead(&encrypted_msg, None);
+             assert!(dec_res.is_err());
+             assert!(matches!(dec_res.unwrap_err(), QfeError::FrameInvalid));
+        }
+
     }
 }
